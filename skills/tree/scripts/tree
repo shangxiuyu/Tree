@@ -1,0 +1,3633 @@
+#!/usr/bin/env python3
+"""
+Tree CLI — Personal Context OS (Local-First, Git-Backed, Agent-Ready)
+Zero external dependencies. Supports CLI, Agent Skill integration, and lightweight Web UI (`tree ui`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # Windows lacks fcntl; fallback to direct append
+import hashlib
+import html
+import http.server
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import tree_focus  # noqa: E402
+import tree_seed  # noqa: E402
+
+DEFAULT_BRANCHES = [
+    "01-关于我",
+    "02-我的思考",
+    "03-我正在做的事",
+    "04-我如何工作",
+]
+DEFAULT_IDENTITY_BRANCHES = ["01-关于我"]
+DEFAULT_L0_EXCLUDED_BRANCHES: list[str] = []
+DEFAULT_L0_STALE_DAYS = 90
+DEFAULT_L0_RECENT_DAYS = 14
+DEFAULT_L0_MAX_CHARS = 18000
+HEAT_AUDIT_WINDOW_DAYS = 30
+HEAT_HALF_LIFE_DAYS = 14.0
+DORMANT_STATUSES = {"paused", "archived", "superseded"}
+
+README_READ_TTL_SECONDS = 7200  # 2 hours
+
+COMPACT_RULES_HEADER = """# [Tree 写入与维护核心契约（精简版，完整版见 `tree rules --full` 或 `tree read README.md`）]
+
+## 1. 铁律与路由边界
+- **操作优先级**：`NOOP > UPDATE > DELETE > ADD`，优先原地更新已有专页，不建碎片新文件。
+- **只存 User Context（关于人）**：严禁把代码仓内部技术手册、函数名、排错流水账搬进 Tree（它们属于项目本地 `CLAUDE.md`/`docs/`）；外部产物只做索引不做全量存储。
+- **四维主干严格分工**：
+  - `01-关于我/`：基本档案、长期目标、价值观与核心偏好（**默认常驻 L0**；非核心底线页面请加 `--no-always`）。
+  - `02-我的思考/`：独立观点、认知判断、问题与困惑（只放“怎么想”，不放“在做什么项目”）。
+  - `03-我正在做的事/`：按 `工作 / 学习 / 生活` 组织当前在推事项（需标 `--kind project|idea`，项目建议附 `--location` 与 `--when`）。
+  - `04-我如何工作/`：跨项目协作规则、表达规范与个人工作流 Skill（`<skill>/SKILL.md`）。
+  - `seed/`：外脑数据源注册表与精选收藏（`seed/*.md` 进 Git；`seed/staging/`、`seed/connectors/`、`seed/sources.json` 自动忽略）。
+  - `outputs/`：快变量产出隔离区（如 `tree daily write` 生成的日报，不进 Git）。
+
+## 2. 写入与安全禁令
+- **人类原创保护**：含 `#note`、`owner: human`、`mode: human` 或 `locked: true` 的页面 AI 只读禁改（除非用户明确指令并加 `--human-approved`）。
+- **禁止子目录 README.md**：正文必须写在具名专页，禁止写入 `<目录>/README.md`。
+- **禁止明文密钥**：严禁写入 API Key、Token、Cookie、密码等敏感凭证。
+- **防截断与命名**：禁止日期流水账命名；长文补充优先用 `--append`，重命名/迁移用 `tree move` 自动同步 `[[双链]]`。
+"""
+
+
+def load_tree_config(root: Path) -> dict:
+    config_file = root / ".tree" / "config.json"
+    if config_file.is_file():
+        try:
+            data = json.loads(config_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def get_branches(root: Path) -> list[str]:
+    cfg = load_tree_config(root)
+    branches = cfg.get("branches")
+    if isinstance(branches, list) and all(isinstance(b, str) and b.strip() for b in branches):
+        return [b.strip() for b in branches]
+    return list(DEFAULT_BRANCHES)
+
+
+def get_identity_branches(root: Path, branches: list[str]) -> list[str]:
+    cfg = load_tree_config(root)
+    id_branches = cfg.get("identity_branches")
+    if isinstance(id_branches, list) and id_branches:
+        return [b.strip() for b in id_branches if isinstance(b, str) and b.strip()]
+    for candidate in ("01-关于我", "01-我是谁"):
+        if candidate in branches:
+            return [candidate]
+    return branches[:1]
+
+
+def is_always_loaded(meta: dict[str, str], branch: str, identity_set: set[str]) -> bool:
+    """Return whether a page is pinned for full L0 injection at cold start."""
+    raw = meta.get("always", "").strip().lower()
+    if raw in {"true", "yes", "1"}:
+        return True
+    if raw in {"false", "no", "0"}:
+        return False
+    return branch in identity_set
+
+
+def get_l0_excluded(root: Path) -> set[str]:
+    cfg = load_tree_config(root)
+    excluded = cfg.get("l0_excluded_branches")
+    if isinstance(excluded, list):
+        return {b.strip() for b in excluded if isinstance(b, str) and b.strip()}
+    return set(DEFAULT_L0_EXCLUDED_BRANCHES)
+
+
+def get_l0_stale_days(root: Path) -> int:
+    cfg = load_tree_config(root)
+    val = cfg.get("l0_stale_days")
+    if isinstance(val, int) and val > 0:
+        return val
+    return DEFAULT_L0_STALE_DAYS
+
+
+def get_l0_recent_days(root: Path) -> int:
+    cfg = load_tree_config(root)
+    val = cfg.get("l0_recent_days")
+    if isinstance(val, int) and val > 0:
+        return val
+    return DEFAULT_L0_RECENT_DAYS
+
+
+def load_recent_audit_usage(
+    root: Path,
+    window_days: int = HEAT_AUDIT_WINDOW_DAYS,
+    today: datetime.date | None = None,
+) -> dict[str, tuple[set[datetime.date], set[datetime.date]]]:
+    """Aggregate deduplicated recent write/read active days per page from .tree/audit.jsonl."""
+    audit_path = root / ".tree" / "audit.jsonl"
+    if not audit_path.is_file():
+        return {}
+    ref_today = today or datetime.datetime.now().date()
+    usage: dict[str, tuple[set[datetime.date], set[datetime.date]]] = {}
+    try:
+        lines = audit_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return {}
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        action = str(rec.get("action") or "")
+        if action not in {"read", "write:create", "write:update"}:
+            continue
+        target = str(rec.get("target") or "").strip().strip("/")
+        if not target or target.lower() == "readme.md" or not target.endswith(".md"):
+            continue
+        ts_raw = str(rec.get("timestamp") or "")
+        if len(ts_raw) < 10:
+            continue
+        try:
+            ev_date = datetime.date.fromisoformat(ts_raw[:10])
+        except ValueError:
+            continue
+        delta = (ref_today - ev_date).days
+        if delta < 0 or delta > window_days:
+            continue
+        writes, reads = usage.setdefault(target, (set(), set()))
+        if action.startswith("write:"):
+            writes.add(ev_date)
+        else:
+            reads.add(ev_date)
+    return usage
+
+
+def compute_page_heat(
+    rel_path: str,
+    age_days: int,
+    kind: str,
+    usage_map: dict[str, tuple[set[datetime.date], set[datetime.date]]],
+    today: datetime.date | None = None,
+) -> tuple[float, int]:
+    """
+    Compute deterministic, naturally-decaying activity heat score (zero manual tags).
+    Combines:
+      1) Recency of `updated` (14-day half-life)
+      2) Recent deduplicated write/read active days from .tree/audit.jsonl (graceful fallback when empty)
+      3) Lightweight decaying prior for active `kind: project` pages (<= 30 days)
+    Returns (heat_score, recent_active_days_count).
+    """
+    ref_today = today or datetime.datetime.now().date()
+    safe_age = max(0, age_days)
+    recency_score = 40.0 * (0.5 ** (safe_age / HEAT_HALF_LIFE_DAYS))
+
+    writes, reads = usage_map.get(rel_path, (set(), set()))
+    write_score = sum(
+        14.0 * (0.5 ** (max(0, (ref_today - d).days) / HEAT_HALF_LIFE_DAYS))
+        for d in writes
+    )
+    read_score = sum(
+        9.0 * (0.5 ** (max(0, (ref_today - d).days) / HEAT_HALF_LIFE_DAYS))
+        for d in reads
+    )
+    prior_score = (
+        10.0 * (0.5 ** (safe_age / HEAT_HALF_LIFE_DAYS))
+        if kind == "project" and safe_age <= HEAT_AUDIT_WINDOW_DAYS
+        else 0.0
+    )
+
+    total = round(recency_score + min(write_score, 35.0) + min(read_score, 27.0) + prior_score, 2)
+    active_days = len(writes | reads)
+    return total, active_days
+
+
+def _strip_unquoted_comment(val: str) -> str:
+    """Strip inline YAML comment (` #...`) outside single/double quotes."""
+    in_quote: str | None = None
+    escaped = False
+    for idx, ch in enumerate(val):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_quote == '"':
+            escaped = True
+            continue
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            continue
+        if ch == "#" and idx > 0 and val[idx - 1].isspace():
+            return val[:idx].rstrip()
+    return val.rstrip()
+
+
+def _unquote_yaml_scalar(val: str) -> str:
+    """Extract a single/double-quoted YAML scalar (handling escaped quotes) or strip unquoted comments."""
+    val = val.strip()
+    if not val:
+        return ""
+    if val[0] == '"':
+        out: list[str] = []
+        escaped = False
+        for ch in val[1:]:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                return "".join(out)
+            out.append(ch)
+        return "".join(out)
+    if val[0] == "'":
+        i = 1
+        out = []
+        while i < len(val):
+            if val[i] == "'":
+                if i + 1 < len(val) and val[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                return "".join(out)
+            out.append(val[i])
+            i += 1
+        return "".join(out)
+    return _strip_unquoted_comment(val)
+
+
+def _split_yaml_inline_array(inner: str) -> list[str]:
+    """Split items inside `[...]` without splitting on commas inside quotes."""
+    items: list[str] = []
+    buf: list[str] = []
+    in_quote: str | None = None
+    escaped = False
+    for ch in inner:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and in_quote == '"':
+            buf.append(ch)
+            escaped = True
+            continue
+        if in_quote:
+            buf.append(ch)
+            if ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+            buf.append(ch)
+            continue
+        if ch == ",":
+            tok = "".join(buf).strip()
+            if tok:
+                items.append(tok)
+            buf = []
+            continue
+        buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def _extract_frontmatter_span(text: str) -> tuple[str, int, int] | None:
+    """Return `(normalized, fm_end_index, body_start_index)` if text starts with valid YAML frontmatter."""
+    normalized = text.replace("\r\n", "\n")
+    if not normalized.startswith("---\n"):
+        return None
+    close_match = re.search(r"\n---[ \t]*(?:\n|$)", normalized[3:])
+    if not close_match:
+        return None
+    return normalized, 3 + close_match.start(), 3 + close_match.end()
+
+
+def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Parse minimal YAML frontmatter (scalars + inline/block lists) without external dependencies."""
+    span = _extract_frontmatter_span(text)
+    if not span:
+        return {}, text
+    normalized, fm_end, body_start = span
+    fm_block = normalized[4:fm_end]
+    body = normalized[body_start:]
+    meta: dict[str, str] = {}
+    lines = fm_block.splitlines()
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        if raw_line[0].isspace() or ":" not in raw_line:
+            i += 1
+            continue
+        k, v = raw_line.split(":", 1)
+        key = k.strip().lower()
+        val = v.strip()
+        if not val:
+            items: list[str] = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                nxt_s = nxt.strip()
+                if not nxt_s or nxt_s.startswith("#"):
+                    j += 1
+                    continue
+                if re.match(r"^\s*-\s+", nxt):
+                    raw_item = re.sub(r"^\s*-\s+", "", nxt).strip()
+                    items.append(_unquote_yaml_scalar(raw_item))
+                    j += 1
+                else:
+                    break
+            if items:
+                meta[key] = "[" + ", ".join(items) + "]"
+                i = j
+                continue
+        val = _unquote_yaml_scalar(val)
+        if key:
+            meta[key] = val
+        i += 1
+    return meta, body
+
+
+def upsert_frontmatter(
+    content: str,
+    updated_date: str,
+    status: str = "",
+    kind: str = "",
+    location: str = "",
+    when: str = "",
+    always: bool | None = None,
+) -> str:
+    """Inject or refresh updated date (and optional always / status / kind / location / when) in Markdown frontmatter."""
+    normalized = content.replace("\r\n", "\n").rstrip()
+    span = _extract_frontmatter_span(normalized)
+    if span:
+        norm_text, fm_end, body_start = span
+        fm_lines = norm_text[4:fm_end].splitlines()
+        body = norm_text[body_start:].lstrip("\n")
+        new_lines: list[str] = []
+        saw_updated = False
+        saw_always = False
+        saw_status = False
+        saw_kind = False
+        saw_location = False
+        saw_when = False
+        for line in fm_lines:
+            stripped = line.strip()
+            low = stripped.lower()
+            if low.startswith("updated:"):
+                new_lines.append(f"updated: {updated_date}")
+                saw_updated = True
+            elif always is not None and low.startswith("always:"):
+                new_lines.append(f"always: {'true' if always else 'false'}")
+                saw_always = True
+            elif status and low.startswith("status:"):
+                new_lines.append(f"status: {status}")
+                saw_status = True
+            elif low.startswith("focus:"):
+                # Silently strip legacy static `focus:` field on write
+                continue
+            elif kind and low.startswith("kind:"):
+                new_lines.append(f"kind: {kind}")
+                saw_kind = True
+            elif location and low.startswith("location:"):
+                new_lines.append(f"location: {location}")
+                saw_location = True
+            elif when and low.startswith("when:"):
+                new_lines.append(f"when: {when}")
+                saw_when = True
+            else:
+                new_lines.append(line)
+        if not saw_updated:
+            new_lines.insert(0, f"updated: {updated_date}")
+        if always is not None and not saw_always:
+            new_lines.append(f"always: {'true' if always else 'false'}")
+        if status and not saw_status:
+            new_lines.append(f"status: {status}")
+        if kind and not saw_kind:
+            new_lines.append(f"kind: {kind}")
+        if location and not saw_location:
+            new_lines.append(f"location: {location}")
+        if when and not saw_when:
+            new_lines.append(f"when: {when}")
+        fm_text = "\n".join(new_lines)
+        return f"---\n{fm_text}\n---\n\n{body}\n" if body else f"---\n{fm_text}\n---\n"
+    header = [f"updated: {updated_date}"]
+    if always is not None:
+        header.append(f"always: {'true' if always else 'false'}")
+    if status:
+        header.append(f"status: {status}")
+    if kind:
+        header.append(f"kind: {kind}")
+    if location:
+        header.append(f"location: {location}")
+    if when:
+        header.append(f"when: {when}")
+    fm_text = "\n".join(header)
+    return f"---\n{fm_text}\n---\n\n{normalized}\n"
+
+
+def get_page_meta_info(md_path: Path, text: str | None = None) -> tuple[dict[str, str], str, datetime.date, str, int]:
+    """Return (meta, body, effective_date, status, age_days) for a Markdown file."""
+    if text is None:
+        text = md_path.read_text(encoding="utf-8")
+    meta, body = parse_frontmatter(text)
+    today = datetime.datetime.now().date()
+    effective_date: datetime.date | None = None
+    raw_updated = meta.get("updated", "").strip()
+    if raw_updated:
+        try:
+            effective_date = datetime.date.fromisoformat(raw_updated[:10])
+        except ValueError:
+            effective_date = None
+    if effective_date is None:
+        try:
+            effective_date = datetime.datetime.fromtimestamp(md_path.stat().st_mtime).date()
+        except Exception:
+            effective_date = today
+    status = (meta.get("status") or "active").strip().lower() or "active"
+    age_days = max(0, (today - effective_date).days)
+    return meta, body, effective_date, status, age_days
+
+
+def is_human_protected(meta: dict[str, str], body: str) -> bool:
+    if meta.get("owner", "").strip().lower() == "human":
+        return True
+    if meta.get("mode", "").strip().lower() == "human":
+        return True
+    if meta.get("locked", "").strip().lower() in {"true", "yes", "1"}:
+        return True
+    tags_raw = meta.get("tags", "").strip().lower()
+    if tags_raw:
+        tokens = [t.strip(" []'\"#") for t in re.split(r"[,，\s]+", tags_raw) if t.strip()]
+        if any(t in {"note", "human"} for t in tokens):
+            return True
+    if re.search(r"(?:^|\s)#note(?:\s|$)", body, re.MULTILINE | re.IGNORECASE):
+        return True
+    return False
+
+
+def find_readme_path(root: Path) -> Path | None:
+    for name in ("README.md", "readme.md"):
+        p = root / name
+        if p.is_file():
+            return p
+    return None
+
+
+def get_readme_hash(readme_path: Path) -> str:
+    return hashlib.sha256(readme_path.read_bytes()).hexdigest()[:12]
+
+
+def _resolve_caller_agent(agent: str = "") -> str:
+    return (
+        agent
+        or os.environ.get("TREE_AGENT")
+        or os.environ.get("AHUB_AGENT_ID")
+        or "cli-user"
+    )
+
+
+def verify_readme_gate(root: Path, agent: str = "") -> None:
+    """Enforce reading current README.md (via `tree rules` or `tree read README.md`) before any write/delete maintenance operation."""
+    readme_path = find_readme_path(root)
+    if not readme_path:
+        return
+    current_hash = get_readme_hash(readme_path)
+    expected_detail = f"sha256:{current_hash}"
+    caller_agent = _resolve_caller_agent(agent)
+    audit_file = root / ".tree" / "audit.jsonl"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    saw_stale_hash = False
+
+    if audit_file.exists():
+        lines = audit_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("action") != "read" or str(rec.get("target", "")).lower() != "readme.md":
+                continue
+            rec_agent = str(rec.get("agent") or "cli-user")
+            if rec_agent != caller_agent:
+                continue
+            try:
+                ts = datetime.datetime.fromisoformat(rec["timestamp"])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
+                age = (now - ts.astimezone(datetime.timezone.utc)).total_seconds()
+            except Exception:
+                continue
+            if age < 0:
+                continue
+            if age > README_READ_TTL_SECONDS:
+                break
+            if rec.get("detail") == expected_detail:
+                return
+            saw_stale_hash = True
+
+    agent_flag = f" --agent {caller_agent}" if caller_agent and caller_agent != "cli-user" else ""
+    if saw_stale_hash:
+        print(
+            f"❌ 维护门禁拦截：根目录 {readme_path.name} 维护准则已更新（当前版本 {expected_detail} 尚未阅读）。",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"❌ 维护门禁拦截：执行写入或维护操作前（agent={caller_agent}），必须先阅读维护准则。",
+            file=sys.stderr,
+        )
+    print(f"👉 请先执行: tree rules{agent_flag}（精简核心契约）或 tree read README.md{agent_flag}", file=sys.stderr)
+    sys.exit(1)
+
+
+def get_tree_root() -> Path:
+    env_home = os.environ.get("TREE_HOME")
+    if env_home:
+        return Path(env_home).expanduser().resolve()
+    skill_dir = Path(__file__).resolve().parent.parent
+    repo_root = skill_dir.parent.parent
+    vault_dir = repo_root / "vault"
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    for candidate in (cwd, *cwd.parents):
+        if candidate == home and cwd != home:
+            break
+        if (candidate / ".tree" / "config.json").is_file():
+            return candidate
+    if (vault_dir / ".tree" / "config.json").is_file() or vault_dir.is_dir():
+        return vault_dir
+    # Only fall back to repo_root when running inside an actual Tree repository/vault (never e.g. ~/.claude)
+    if (repo_root / "bin" / "tree").exists() or (repo_root / ".tree" / "config.json").is_file():
+        return vault_dir if (repo_root / "bin" / "tree").exists() else repo_root
+    return Path.cwd().resolve()
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def ensure_meta_dir(root: Path) -> Path:
+    meta = root / ".tree"
+    meta.mkdir(parents=True, exist_ok=True)
+    return meta
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Write text atomically via a PID-scoped temporary file in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.{os.getpid()}.tmp"
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        raise
+
+
+def append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(record, ensure_ascii=False) + "\n"
+    with open(path, "a", encoding="utf-8") as f:
+        try:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(payload)
+            f.flush()
+        finally:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+
+
+def log_audit(root: Path, action: str, target: str, agent: str = "", detail: str = "") -> None:
+    meta = ensure_meta_dir(root)
+    detected_agent = _resolve_caller_agent(agent)
+    append_jsonl(
+        meta / "audit.jsonl",
+        {
+            "timestamp": now_iso(),
+            "action": action,
+            "target": target,
+            "agent": detected_agent,
+            "detail": detail,
+        },
+    )
+
+
+def git_run(root: Path, args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-c", "core.quotepath=false"] + args,
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+    )
+
+
+def _format_git_err(res: subprocess.CompletedProcess) -> str:
+    err = (res.stderr or res.stdout or "").strip()
+    if "Please tell me who you are" in err or "Author identity unknown" in err:
+        return "未配置 Git 身份，请运行 `git config user.name \"Your Name\" && git config user.email \"you@example.com\"`"
+    return err or f"git exited with code {res.returncode}"
+
+
+def git_commit_change(root: Path, rel_paths: str | list[str], action: str, reason: str, agent: str) -> tuple[bool, str]:
+    if not (root / ".git").exists():
+        init_res = git_run(root, ["init", "-q"])
+        if init_res.returncode != 0:
+            return False, _format_git_err(init_res)
+    paths_list = [rel_paths] if isinstance(rel_paths, str) else list(rel_paths)
+    add_res = git_run(root, ["add", "-A", *paths_list, ".tree/changelog.jsonl"])
+    if add_res.returncode != 0:
+        return False, _format_git_err(add_res)
+    target_label = paths_list[0] if len(paths_list) == 1 else f"{paths_list[0]} (+{len(paths_list) - 1})"
+    msg = f"tree({action}): {target_label}"
+    if reason:
+        msg += f" — {reason}"
+    if agent:
+        msg += f" [by {agent}]"
+    commit_res = git_run(root, ["commit", "-q", "-m", msg])
+    if commit_res.returncode != 0:
+        return False, _format_git_err(commit_res)
+    return True, ""
+
+
+def _discover_vault_skill_dirs(root: Path) -> list[tuple[str, Path]]:
+    """Discover user-owned standard Agent Skills (`<branch>/<skill-name>/SKILL.md`) inside 04 working-norms branch."""
+    found: list[tuple[str, Path]] = []
+    seen_names: set[str] = set()
+    for b in get_branches(root):
+        if not b.startswith("04-"):
+            continue
+        b_dir = root / b
+        if not b_dir.is_dir():
+            continue
+        for child in sorted(b_dir.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            skill_md = child / "SKILL.md"
+            if skill_md.is_file():
+                meta, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+                s_name = (meta.get("name") or child.name).strip()
+                if s_name and s_name not in seen_names:
+                    found.append((s_name, child))
+                    seen_names.add(s_name)
+    return found
+
+
+def _iter_branch_pages(root: Path, b_dir: Path, include_readme: bool = False) -> list[Path]:
+    """Iterate Markdown pages in a branch, treating standard Skill folders (`<dir>/SKILL.md`) as a single SKILL.md entry."""
+    if not b_dir.exists():
+        return []
+    is_seed_branch = (b_dir.resolve() == (root / "seed").resolve())
+    skill_dirs: list[Path] = []
+    for child in sorted(b_dir.iterdir()):
+        if child.is_dir() and not child.name.startswith(".") and (child / "SKILL.md").is_file():
+            skill_dirs.append(child.resolve())
+
+    pages: list[Path] = []
+    for f in sorted(b_dir.rglob("*.md")):
+        if not include_readme and f.name.lower() == "readme.md":
+            continue
+        if is_seed_branch:
+            rel_parts = f.relative_to(b_dir).parts
+            if rel_parts and rel_parts[0] in {"staging", "connectors"}:
+                continue
+        resolved = f.resolve()
+        in_skill_aux = False
+        for s_dir in skill_dirs:
+            try:
+                rel_to_skill = resolved.relative_to(s_dir)
+                if rel_to_skill.as_posix() != "SKILL.md":
+                    in_skill_aux = True
+                break
+            except ValueError:
+                continue
+        if in_skill_aux:
+            continue
+        pages.append(f)
+    return pages
+
+
+def _seed_default_vault_skills(root: Path, only_skill: str = "") -> list[str]:
+    """Copy bundled default Skill templates from `assets/default-skills/` into `04-我如何工作/` if missing."""
+    import shutil
+
+    assets_skills = Path(__file__).resolve().parent.parent / "assets" / "default-skills"
+    if not assets_skills.is_dir():
+        return []
+    branches = get_branches(root)
+    work_branch = next((b for b in branches if b.startswith("04-")), "04-我如何工作")
+    work_dir = root / work_branch
+    work_dir.mkdir(parents=True, exist_ok=True)
+    created: list[str] = []
+    for src_dir in sorted(assets_skills.iterdir()):
+        if not src_dir.is_dir() or not (src_dir / "SKILL.md").is_file():
+            continue
+        if only_skill and src_dir.name != only_skill:
+            continue
+        dst_dir = work_dir / src_dir.name
+        if not dst_dir.exists():
+            shutil.copytree(src_dir, dst_dir)
+            created.append(f"{work_branch}/{src_dir.name}")
+    return created
+
+
+def _strip_md_summary_syntax(text: str) -> str:
+    """Strip Markdown syntax from summary text while keeping underscores inside identifiers like `deploy_cloud.sh`."""
+    cleaned = re.sub(r"[*`\[\]]", "", text)
+    return re.sub(r"(?<!\w)_+|_+(?!\w)", "", cleaned).strip()
+
+
+def extract_first_summary(
+    md_path: Path,
+    meta: dict[str, str] | None = None,
+    body: str | None = None,
+) -> str:
+    if meta is None or body is None:
+        try:
+            text = md_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        meta, body = parse_frontmatter(text)
+    if meta.get("summary"):
+        s = meta["summary"].strip()
+        return (s[:75] + "…") if len(s) > 75 else s
+    if md_path.name == "SKILL.md" and meta.get("description"):
+        s = meta["description"].strip()
+        return (s[:75] + "…") if len(s) > 75 else s
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith(">"):
+            q = _strip_md_summary_syntax(re.sub(r"^>\s*", "", line))
+            m = re.search(r"核心(?:定位|判断|事实|原则|身份|底线)[：:]\s*(.+)$", q)
+            if m:
+                q = m.group(1).strip()
+            else:
+                q = re.sub(r"^适用时机[：:].*?[。；;]\s*", "", q).strip()
+            if q:
+                return (q[:75] + "…") if len(q) > 75 else q
+    for line in lines:
+        if line.startswith("#") or line.startswith("---") or line.startswith(">"):
+            continue
+        clean = _strip_md_summary_syntax(re.sub(r"^[-*+]\s+", "", line))
+        if clean:
+            return (clean[:75] + "…") if len(clean) > 75 else clean
+    for line in lines:
+        if line.startswith("#"):
+            return line.lstrip("#").strip()
+    return ""
+
+
+def safe_resolve(root: Path, rel_path: str) -> Path:
+    cleaned = rel_path.strip().lstrip("/")
+    root_resolved = root.resolve()
+    target = (root_resolved / cleaned).resolve()
+    if not target.is_relative_to(root_resolved):
+        raise ValueError(f"非法路径越界: {rel_path}")
+    return target
+
+
+def _get_host_skill_targets(home: Path, custom_target: str = "") -> list[tuple[str, Path, Path, bool]]:
+    """Return `(label, host_root, skills_dir, explicit_target)` for local AI agents."""
+    host_roots: list[tuple[str, Path, Path, bool]] = [
+        ("Claude Code", home / ".claude", home / ".claude" / "skills", False),
+        ("Codex", home / ".codex", home / ".codex" / "skills", False),
+        ("Gemini / Antigravity", home / ".gemini" / "config", home / ".gemini" / "config" / "skills", False),
+        ("Hermes Agent", home / ".hermes", home / ".hermes" / "skills", False),
+        ("OpenCode", home / ".config" / "opencode", home / ".config" / "opencode" / "skills", False),
+        ("Windsurf", home / ".codeium" / "windsurf", home / ".codeium" / "windsurf" / "skills", False),
+        ("Universal Agents", home / ".agents", home / ".agents" / "skills", False),
+        ("Cursor", home / ".cursor", home / ".cursor" / "skills", False),
+        ("Trae", home / ".trae", home / ".trae" / "skills", False),
+        ("WorkBuddy", home / ".workbuddy", home / ".workbuddy" / "skills", False),
+        ("OpenClaw", home / ".openclaw", home / ".openclaw" / "skills", False),
+    ]
+    # Also mount ~/.gemini/skills when ~/.gemini exists and either ~/.gemini/config is absent
+    # or ~/.gemini/skills already exists (e.g., Gemini CLI + Antigravity coexisting).
+    gemini_base = home / ".gemini"
+    if gemini_base.exists() and (
+        not (gemini_base / "config").exists() or (gemini_base / "skills").exists()
+    ):
+        host_roots.insert(3, ("Gemini CLI", gemini_base, gemini_base / "skills", False))
+    if custom_target:
+        custom_skills_dir = Path(custom_target).expanduser()
+        host_roots.append(("Custom Target", custom_skills_dir, custom_skills_dir, True))
+    return host_roots
+
+
+def _refresh_mounted_vault_skill_links(root: Path, home: Path | None = None) -> int:
+    """If host agents already point skills (like `tree-daily`) at bundled templates, upgrade them to the vault copy."""
+    vault_skills = _discover_vault_skill_dirs(root)
+    if not vault_skills:
+        return 0
+    assets_default_dir = (Path(__file__).resolve().parent.parent / "assets" / "default-skills").resolve()
+    h = (home or Path.home()).expanduser().resolve()
+    upgraded = 0
+    for label, host_root, skills_dir, _ in _get_host_skill_targets(h):
+        if not host_root.exists():
+            continue
+        effective_dir = skills_dir
+        if label == "Cursor" and effective_dir.is_symlink() and not effective_dir.exists() and (host_root / "skills-cursor").is_dir():
+            effective_dir = host_root / "skills-cursor"
+        if not effective_dir.is_dir():
+            continue
+        for s_name, s_src in vault_skills:
+            link_path = effective_dir / s_name
+            if not link_path.is_symlink():
+                continue
+            try:
+                cur_target = link_path.resolve()
+            except Exception:
+                cur_target = None
+            if cur_target != s_src.resolve() and (
+                cur_target is None or cur_target.is_relative_to(assets_default_dir)
+            ):
+                link_path.unlink()
+                link_path.symlink_to(s_src)
+                upgraded += 1
+    return upgraded
+
+
+def cmd_init(root: Path, _args: argparse.Namespace) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    branches = get_branches(root)
+    for b in branches:
+        (root / b).mkdir(parents=True, exist_ok=True)
+    meta = ensure_meta_dir(root)
+    config_file = meta / "config.json"
+    if not config_file.exists():
+        config_file.write_text(
+            json.dumps(
+                {
+                    "name": "Tree Personal Context OS",
+                    "version": "0.2.0",
+                    "created_at": now_iso(),
+                    "branches": branches,
+                    "identity_branches": DEFAULT_IDENTITY_BRANCHES,
+                    "l0_excluded_branches": DEFAULT_L0_EXCLUDED_BRANCHES,
+                    "l0_stale_days": DEFAULT_L0_STALE_DAYS,
+                    "l0_recent_days": DEFAULT_L0_RECENT_DAYS,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        ig_lines = [
+            ".DS_Store",
+            ".tree/audit.jsonl",
+            ".tree/sync.log",
+            "outputs/",
+        ]
+        if (root / "bin").exists():
+            ig_lines.append("bin/__pycache__/")
+        ig_lines.extend([
+            "seed/staging/",
+            "seed/connectors/",
+            "seed/sources.json",
+            "seed/图片与审美/**/*",
+            "!seed/图片与审美/**/",
+            "!seed/图片与审美/**/*.md",
+        ])
+        gitignore.write_text("\n".join(ig_lines) + "\n", encoding="utf-8")
+    readme = root / "README.md"
+    if not readme.exists():
+        template_readme = Path(__file__).resolve().parent.parent / "assets" / "TREE_README.md"
+        if template_readme.is_file() and template_readme.resolve() != readme.resolve():
+            readme.write_text(template_readme.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            readme.write_text(
+                "# Tree —— 个人上下文底座（Personal Context OS）\n\n"
+                "> **显式契约**：所有 AI Agent 写入或维护 Tree 前必须先读取本文件。\n\n"
+                "- 默认四维主干：`01-关于我/`、`02-我的思考/`、`03-我正在做的事/`、`04-我如何工作/`。\n"
+                "- 铁律：`NOOP > UPDATE > DELETE > ADD`，只记模型不知道的个人差量；对外部产物只做索引不做存储。\n"
+                "- 人类原创笔记（`#note` / `owner: human`）AI 只读禁改。\n",
+                encoding="utf-8",
+            )
+    seeded_skills = _seed_default_vault_skills(root)
+    upgraded_links = _refresh_mounted_vault_skill_links(root)
+    init_git_warn = ""
+    if not (root / ".git").exists():
+        git_run(root, ["init", "-q"])
+        git_run(root, ["add", "."])
+        c_res = git_run(root, ["commit", "-q", "-m", "tree(init): initialize personal context tree"])
+        if c_res.returncode != 0:
+            init_git_warn = _format_git_err(c_res)
+    print(f"✅ Tree 已初始化于: {root}")
+    if seeded_skills:
+        print(f"🧩 已预置默认个人 Skill 模板: {', '.join(seeded_skills)}（可直接按需自定义）")
+    if upgraded_links:
+        print(f"🔗 已自动将 {upgraded_links} 处已挂载宿主 Skill 软链升级指向你的个人知识库副本")
+    if init_git_warn:
+        print(f"⚠️ 初始 Git 提交未完成：{init_git_warn}", file=sys.stderr)
+    if not upgraded_links:
+        print("👉 下一步：若尚未挂载到本机 AI 客户端，请运行 `tree install-skill`，随后在任意 AI 对话中启动破土初始化。")
+
+
+def collect_active_always_pages(root: Path) -> list[tuple[str, str, str]]:
+    """Return list of `(rel_path, body, updated_iso)` for all active `always: true` pages in the vault."""
+    branches = get_branches(root)
+    identity_set = set(get_identity_branches(root, branches))
+    l0_excluded = get_l0_excluded(root)
+    always_pages: list[tuple[str, str, str]] = []
+    for b in branches:
+        if b in l0_excluded:
+            continue
+        b_dir = root / b
+        if not b_dir.exists():
+            continue
+        for f in sorted(b_dir.rglob("*.md")):
+            if f.name.lower() == "readme.md":
+                continue
+            meta, body, eff_date, status, _ = get_page_meta_info(f)
+            if is_always_loaded(meta, b, identity_set) and status not in DORMANT_STATUSES:
+                always_pages.append((str(f.relative_to(root)), body, eff_date.isoformat()))
+    return always_pages
+
+
+def auto_reconcile_external_file_edits(root: Path) -> list[str]:
+    """
+    Universal fallback self-healing:
+    When a host agent has no Shell tool or its sandboxed Shell failed (e.g. Exit Code 127)
+    and the agent fell back to editing `01~04` Markdown files directly via file-edit tools,
+    detect uncommitted Markdown modifications, refresh `updated` date, auto-commit to Git,
+    record changelog/audit, and sync global instruction blocks.
+    """
+    if not (root / ".git").exists():
+        return []
+    status_res = git_run(root, ["status", "--porcelain"])
+    raw_lines = [ln for ln in (status_res.stdout or "").splitlines() if ln.strip()]
+    if not raw_lines:
+        return []
+
+    branches = tuple([*get_branches(root), "seed"])
+    reconciled_paths: list[str] = []
+    stage_paths: list[str] = []
+    today_str = datetime.datetime.now().date().isoformat()
+    meta_dir = ensure_meta_dir(root)
+
+    def _decode_git_path(p_raw: str) -> str:
+        p_raw = p_raw.strip()
+        if p_raw.startswith('"') and p_raw.endswith('"'):
+            try:
+                return p_raw[1:-1].encode("latin1").decode("unicode_escape").encode("latin1").decode("utf-8")
+            except Exception:
+                return p_raw.strip('"')
+        return p_raw
+
+    for line in raw_lines:
+        if len(line) < 4:
+            continue
+        status_xy = line[:2]
+        # Only reconcile tracked modified files (skip untracked `??` files unless explicitly written)
+        if status_xy == "??":
+            continue
+        raw_rel = line[3:].strip()
+        old_rel = ""
+        if " -> " in raw_rel:
+            old_part, new_part = raw_rel.split(" -> ", 1)
+            old_rel = _decode_git_path(old_part)
+            raw_rel = _decode_git_path(new_part)
+        else:
+            raw_rel = _decode_git_path(raw_rel)
+
+        if not raw_rel.endswith(".md") or not any(raw_rel.startswith(b + "/") for b in branches):
+            continue
+        if raw_rel.startswith(("seed/staging/", "seed/connectors/")):
+            continue
+        md_file = root / raw_rel
+        if md_file.is_file():
+            try:
+                old_text = md_file.read_text(encoding="utf-8")
+                # Check if the external edit already modified the `updated:` line; if not, refresh `updated` to today
+                head_diff = git_run(root, ["diff", "HEAD", "--", raw_rel]).stdout or ""
+                already_changed_updated = bool(re.search(r"^\+updated:\s*\d{4}-\d{2}-\d{2}", head_diff, re.MULTILINE))
+                if not already_changed_updated:
+                    refreshed = upsert_frontmatter(old_text, today_str)
+                    if refreshed != old_text:
+                        atomic_write_text(md_file, refreshed)
+            except Exception:
+                pass
+        reconciled_paths.append(raw_rel)
+        if old_rel:
+            stage_paths.append(old_rel)
+        stage_paths.append(raw_rel)
+        append_jsonl(
+            meta_dir / "changelog.jsonl",
+            {
+                "timestamp": now_iso(),
+                "action": "reconcile",
+                "path": raw_rel,
+                "agent": "file-tool-fallback",
+                "reason": "自动收拢宿主直接文件编辑并补齐 Git 提交",
+            },
+        )
+        log_audit(root, "write:reconcile", raw_rel, agent="file-tool-fallback", detail="auto-reconciled direct file edit")
+
+    if reconciled_paths:
+        git_run(root, ["add", "-A", *stage_paths, ".tree/changelog.jsonl"])
+        summary_paths = ", ".join(reconciled_paths[:3]) + (f" (+{len(reconciled_paths) - 3})" if len(reconciled_paths) > 3 else "")
+        c_res = git_run(root, ["commit", "-q", "-m", f"tree(reconcile): {summary_paths} — 自动收拢宿主文件编辑"])
+        if c_res.returncode == 0:
+            auto_refresh_global_instructions_if_mounted(root)
+        else:
+            print(f"⚠️ 自动收拢提交 Git 失败: {_format_git_err(c_res)}", file=sys.stderr)
+
+    return reconciled_paths
+
+
+def auto_refresh_global_instructions_if_mounted(root: Path) -> None:
+    """Silently refresh any already-mounted global instruction blocks when vault content changes."""
+    try:
+        always_pages = collect_active_always_pages(root)
+        results = tree_focus.sync_global_instructions(
+            root,
+            always_pages,
+            only_existing_blocks=True,
+        )
+        updated = [label for label, _, st in results if st in {"updated", "created"}]
+        if updated:
+            print(f"🔄 已自动同步 L0 常驻底线至全局指令文件: {', '.join(updated)}")
+    except Exception:
+        pass
+
+
+def cmd_sync_global(root: Path, args: argparse.Namespace) -> None:
+    """Synchronize or remove the L0-Static managed block across installed host agents' global instruction files."""
+    dry_run = bool(getattr(args, "dry_run", False))
+    remove = bool(getattr(args, "remove", False))
+    always_pages = collect_active_always_pages(root)
+    results = tree_focus.sync_global_instructions(
+        root,
+        always_pages,
+        dry_run=dry_run,
+        remove=remove,
+        only_existing_blocks=False,
+    )
+    action_title = "移除" if remove else "同步"
+    print(f"🌐 全局指令页受控块{action_title}（`<!-- TREE-CONTEXT:START -->` ... `<!-- TREE-CONTEXT:END -->`）：")
+    if not results:
+        print("  (未检测到需要处理的宿主全局指令文件)")
+        return
+    for label, fp, st in results:
+        prefix = "[DRY-RUN] " if dry_run else ""
+        status_cn = {
+            "created": "✅ 已创建并写入受控块",
+            "updated": "✅ 已刷新受控块",
+            "unchanged": "ℹ️ 已是最新（无变更）",
+            "removed": "🗑️ 已移除受控块（保留用户原有内容）",
+        }.get(st, st)
+        print(f"  {prefix}{label:<24} {status_cn} -> {fp}")
+    if not dry_run:
+        log_audit(root, "sync_global", "remove" if remove else "sync", detail=f"count={len(results)}")
+def cmd_install_skill(root: Path, args: argparse.Namespace) -> None:
+    """Mount `tree` CLI and `tree` Skill into existing local agent directories (minimal footprint)."""
+    script_path = Path(__file__).resolve()
+    skill_src = script_path.parent.parent
+    if not (skill_src / "SKILL.md").is_file():
+        print(f"❌ 未找到 Skill 源目录: {skill_src}", file=sys.stderr)
+        sys.exit(1)
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    force = bool(getattr(args, "force", False))
+    home = Path.home().expanduser().resolve()
+
+    # 1. Link CLI executable into bin_dir (default ~/.local/bin/tree)
+    bin_dir = Path(args.bin_dir).expanduser() if getattr(args, "bin_dir", "") else (home / ".local" / "bin")
+    cli_link = bin_dir / "tree"
+    print(f"🌱 Tree 安装向导（最小足迹模式{' · DRY-RUN 预览' if dry_run else ''}）")
+    print(f"   CLI 源码: {script_path}")
+    print(f"   Skill 源: {skill_src}\n")
+
+    if not dry_run:
+        try:
+            script_path.chmod(script_path.stat().st_mode | 0o111)
+        except Exception:
+            pass
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        if cli_link.is_symlink() or (cli_link.exists() and force):
+            if cli_link.is_dir() and not cli_link.is_symlink():
+                print(f"⚠️ 跳过 CLI 软链（目标已是目录）: {cli_link}")
+            else:
+                cli_link.unlink()
+                cli_link.symlink_to(script_path)
+                print(f"✅ 已更新 CLI 软链: {cli_link} -> {script_path}")
+        elif not cli_link.exists():
+            cli_link.symlink_to(script_path)
+            print(f"✅ 已创建 CLI 软链: {cli_link} -> {script_path}")
+        else:
+            print(f"ℹ️ CLI 目标已存在（保留未覆盖，加 --force 可覆盖）: {cli_link}")
+    else:
+        print(f"[DRY-RUN] 将创建 CLI 软链: {cli_link} -> {script_path}")
+
+    # 2. Mount core `tree` skill + user-owned standard skills discovered in vault `04-我如何工作/<skill>/SKILL.md`
+    #    (and fall back to bundled `assets/default-skills/` if `tree init` hasn't run yet)
+    skill_sources: list[tuple[str, Path]] = [(skill_src.name, skill_src)]
+    seen_skill_names = {skill_src.name}
+    for v_name, v_dir in _discover_vault_skill_dirs(root):
+        if v_name not in seen_skill_names:
+            skill_sources.append((v_name, v_dir))
+            seen_skill_names.add(v_name)
+    assets_default_skills = skill_src / "assets" / "default-skills"
+    if assets_default_skills.is_dir():
+        for d_dir in sorted(assets_default_skills.iterdir()):
+            if d_dir.is_dir() and (d_dir / "SKILL.md").is_file() and d_dir.name not in seen_skill_names:
+                skill_sources.append((d_dir.name, d_dir))
+                seen_skill_names.add(d_dir.name)
+
+    # Link Skills ONLY into host agent directories that already exist on this machine
+    # (Explicit --target is always honored and created if needed)
+    host_roots = _get_host_skill_targets(home, custom_target=getattr(args, "target", "") or "")
+
+    mounted = 0
+    skipped = 0
+    skill_names = ", ".join(name for name, _ in skill_sources)
+    print(f"   待挂载 Skill: {skill_names}")
+    print(f"\n📦 Skill 宿主挂载（{skill_names}；仅写入本机已存在的工具目录，绝不凭空创建）：")
+    for label, host_root, skills_dir, explicit_target in host_roots:
+        if not explicit_target and not host_root.exists():
+            skipped += 1
+            continue
+        effective_skills_dir = skills_dir
+        if effective_skills_dir.is_symlink() and not effective_skills_dir.exists():
+            fallback_cursor = host_root / "skills-cursor"
+            if label == "Cursor" and fallback_cursor.is_dir():
+                effective_skills_dir = fallback_cursor
+            elif not dry_run:
+                effective_skills_dir.unlink()
+                effective_skills_dir.mkdir(parents=True, exist_ok=True)
+        elif not dry_run:
+            effective_skills_dir.mkdir(parents=True, exist_ok=True)
+
+        for s_name, s_src in skill_sources:
+            # Clean up legacy `tree-context` symlink when installing renamed `tree` skill
+            if s_name == "tree":
+                legacy_link = effective_skills_dir / "tree-context"
+                if legacy_link.is_symlink() and not dry_run:
+                    legacy_link.unlink()
+            link_path = effective_skills_dir / s_name
+            tag = f"{label} ({s_name})"
+            if dry_run:
+                print(f"  [DRY-RUN] {tag:<34} -> {link_path}")
+                mounted += 1
+                continue
+            if link_path.is_symlink():
+                link_path.unlink()
+                link_path.symlink_to(s_src)
+                print(f"  ✅ {tag:<34} (已更新) -> {link_path}")
+                mounted += 1
+            elif link_path.exists():
+                if force:
+                    import shutil
+                    if link_path.is_dir():
+                        shutil.rmtree(link_path)
+                    else:
+                        link_path.unlink()
+                    link_path.symlink_to(s_src)
+                    print(f"  ✅ {tag:<34} (已覆盖) -> {link_path}")
+                    mounted += 1
+                else:
+                    print(f"  ℹ️ {tag:<34} (已存在非软链目录，跳过；加 --force 覆盖) -> {link_path}")
+            else:
+                link_path.symlink_to(s_src)
+                print(f"  ✅ {tag:<34} (已挂载) -> {link_path}")
+                mounted += 1
+
+    print(f"\n完成：已处理 {mounted} 项 Skill 挂载，跳过 {skipped} 个本机未安装的工具。")
+
+    # 3. Sync L0-Static managed block into host global instruction files (unless --no-global-rules)
+    if not getattr(args, "no_global_rules", False) and not getattr(args, "target", ""):
+        print("")
+        always_pages = collect_active_always_pages(root)
+        g_results = tree_focus.sync_global_instructions(
+            root,
+            always_pages,
+            dry_run=dry_run,
+            remove=False,
+            only_existing_blocks=False,
+        )
+        print("🌐 全局指令文件受控块同步（第 0 秒常驻底线 + 第 1 秒情境点亮唤醒器）：")
+        for label, fp, st in g_results:
+            prefix = "[DRY-RUN] " if dry_run else ""
+            status_cn = {
+                "created": "✅ 已写入受控块",
+                "updated": "✅ 已更新受控块",
+                "unchanged": "✅ 已是最新",
+            }.get(st, st)
+            print(f"  {prefix}{label:<24} {status_cn} -> {fp}")
+
+    # 4. Universal Environment Self-Healing (Shell RC PATH check + WorkBuddy Sandbox allowlist + Pending edit reconcile)
+    rc_repairs = tree_focus.check_and_repair_shell_rc_path(home=home, dry_run=dry_run)
+    wb_updated, wb_msg = tree_focus.ensure_workbuddy_sandbox_allow_write(root, home=home, dry_run=dry_run)
+    if rc_repairs or wb_updated:
+        print("\n🛠️ 宿主环境与沙盒自适应修复：")
+        prefix = "[DRY-RUN] " if dry_run else ""
+        for rc_path, r_msg in rc_repairs:
+            print(f"  {prefix}✅ {rc_path}: {r_msg}")
+        if wb_updated:
+            print(f"  {prefix}✅ WorkBuddy 沙盒授权: {wb_msg}")
+    vault_initialized = (root / ".tree" / "config.json").is_file() or (root / "README.md").is_file()
+    if not dry_run and vault_initialized:
+        reconciled = auto_reconcile_external_file_edits(root)
+        if reconciled:
+            print(f"  🔄 已自动收拢并提交 {len(reconciled)} 处宿主直接文件编辑: {', '.join(reconciled)}")
+    elif not vault_initialized:
+        print(f"💡 提示：知识库 `{root}` 尚未初始化；运行 `tree init` 后会自动将已挂载的 `tree-daily` 软链升级指向你的个人知识库。")
+
+    path_env = os.environ.get("PATH", "").split(os.pathsep)
+    if str(bin_dir) not in path_env and str(bin_dir.resolve()) not in path_env:
+        shell_rc = "~/.bashrc" if "bash" in os.environ.get("SHELL", "") else "~/.zshrc"
+        print(f"💡 提示：`{bin_dir}` 尚未加入 PATH，可在 `{shell_rc}` 添加：`export PATH=\"{bin_dir}:$PATH\"`")
+    if not dry_run and vault_initialized:
+        log_audit(root, "install_skill", str(skill_src), detail=f"mounted={mounted}")
+
+
+def cmd_context(root: Path, args: argparse.Namespace) -> None:
+    """Output L0 Progressive Disclosure Context Package for AI Agents."""
+    auto_reconcile_external_file_edits(root)
+    raw_cwd = getattr(args, "cwd", "") or ""
+    caller_cwd = Path(raw_cwd).expanduser().resolve() if raw_cwd else Path.cwd().resolve()
+    query_str = (getattr(args, "query", "") or "").strip()
+    no_auto_focus = bool(getattr(args, "no_auto_focus", False))
+
+    log_audit(
+        root,
+        "context_package",
+        "L0",
+        detail=f"cwd={caller_cwd}" + (f",q={query_str}" if query_str else ""),
+    )
+    branches = get_branches(root)
+    identity_branches = get_identity_branches(root, branches)
+    l0_excluded = get_l0_excluded(root)
+    stale_days = get_l0_stale_days(root)
+    recent_days = get_l0_recent_days(root)
+
+    out = []
+    out.append("# [Tree Personal Context — L0 全景导航包]")
+    out.append(
+        f"> 仓库路径: `{root}` | 情境透镜: `tree context -q \"<话题>\"` | 按需精读: `tree read \"<相对路径>\"` | 写入前必读: `tree rules`"
+    )
+    out.append("")
+
+    # Collect always-on (L0) pages, active on-demand pages, and PageNodes for Situational Auto-Focus
+    identity_set = set(identity_branches)
+    usage_map = load_recent_audit_usage(root)
+    always_items: list[tuple[Path, str, datetime.date]] = []
+    branch_active_map: list[tuple[str, list[tuple[float, datetime.date, Path, str, int, int, str, str]], int, int]] = []
+    hot_items: list[tuple[float, datetime.date, Path, str, int, str, str]] = []
+    focus_nodes: list[tree_focus.PageNode] = []
+
+    for b in branches:
+        if b in l0_excluded:
+            continue
+        b_dir = root / b
+        if not b_dir.exists():
+            continue
+        files = _iter_branch_pages(root, b_dir)
+        active_items: list[tuple[float, datetime.date, Path, str, int, int, str, str]] = []
+        always_in_branch = 0
+        dormant_count = 0
+        for f in files:
+            meta, body, eff_date, status, age_days = get_page_meta_info(f)
+            always_flag = is_always_loaded(meta, b, identity_set)
+            kind = (meta.get("kind") or "").strip().lower()
+            location = (meta.get("location") or "").strip()
+            summary = extract_first_summary(f, meta=meta, body=body)
+            rel_str = str(f.relative_to(root))
+            heat_score, active_days = compute_page_heat(rel_str, age_days, kind, usage_map)
+
+            if status not in DORMANT_STATUSES and age_days <= stale_days:
+                focus_nodes.append(
+                    tree_focus.PageNode(
+                        path=f,
+                        rel_path=rel_str,
+                        branch=b,
+                        stem=f.stem,
+                        meta=meta,
+                        body=body,
+                        updated_iso=eff_date.isoformat(),
+                        status=status,
+                        age_days=age_days,
+                        is_always=always_flag,
+                        heat_score=heat_score,
+                        summary=summary,
+                        trigger_hint=tree_focus._extract_trigger_hint(meta, body),
+                        locations=tree_focus._split_multi_values(location),
+                        when_rules=tree_focus._split_multi_values(meta.get("when", "")),
+                        tags=tree_focus._extract_tags(meta, body),
+                        wikilinks=tree_focus._extract_wikilinks(body),
+                    )
+                )
+
+            if always_flag:
+                if status in DORMANT_STATUSES:
+                    dormant_count += 1
+                    continue
+                always_in_branch += 1
+                always_items.append((f, body, eff_date))
+                continue
+            if status in DORMANT_STATUSES or age_days > stale_days:
+                dormant_count += 1
+                continue
+            active_items.append((heat_score, eff_date, f, summary, active_days, age_days, kind, location))
+            if age_days <= recent_days or active_days > 0:
+                hot_items.append((heat_score, eff_date, f, summary, active_days, kind, location))
+        active_items.sort(key=lambda x: (x[0], x[1], x[2].as_posix()), reverse=True)
+        branch_active_map.append((b, active_items, dormant_count, always_in_branch))
+
+    # Also collect active pages from explicit `seed/` directory so they participate in
+    # Situational Auto-Focus (`-q` query lens, `when` rules, and `[[wikilinks]]` resonance)
+    # and render cleanly in the L0 directory map.
+    seed_dir = root / "seed"
+    active_seed_items: list[tuple[Path, datetime.date, str]] = []
+    dormant_seed_count = 0
+    if seed_dir.is_dir():
+        for sf in _iter_branch_pages(root, seed_dir):
+            sf_meta, sf_body, sf_date, sf_status, sf_age = get_page_meta_info(sf)
+            if sf_status in DORMANT_STATUSES:
+                dormant_seed_count += 1
+                continue
+            sf_rel = str(sf.relative_to(root))
+            sf_sum = extract_first_summary(sf, meta=sf_meta, body=sf_body)
+            sf_heat, _ = compute_page_heat(sf_rel, sf_age, (sf_meta.get("kind") or "").strip().lower(), usage_map)
+            active_seed_items.append((sf, sf_date, sf_sum))
+            focus_nodes.append(
+                tree_focus.PageNode(
+                    path=sf,
+                    rel_path=sf_rel,
+                    branch="seed",
+                    stem=sf.stem,
+                    meta=sf_meta,
+                    body=sf_body,
+                    updated_iso=sf_date.isoformat(),
+                    status=sf_status,
+                    age_days=sf_age,
+                    is_always=False,
+                    heat_score=sf_heat,
+                    summary=sf_sum,
+                    trigger_hint=tree_focus._extract_trigger_hint(sf_meta, sf_body),
+                    locations=tree_focus._split_multi_values((sf_meta.get("location") or "").strip()),
+                    when_rules=tree_focus._split_multi_values(sf_meta.get("when", "")),
+                    tags=tree_focus._extract_tags(sf_meta, sf_body),
+                    wikilinks=tree_focus._extract_wikilinks(sf_body),
+                )
+            )
+
+    # 1. Always-loaded core pages (always: true, decoupled from directory ownership)
+    if always_items:
+        out.append("## 一、常驻核心上下文（L0 Always-On）")
+        for f, body, eff_date in always_items:
+            rel = f.relative_to(root)
+            body_lines = body.strip().splitlines()
+            max_lines = 28
+            snippet = "\n".join(body_lines[:max_lines])
+            if len(body_lines) > max_lines:
+                snippet += f"\n…[已截断，余 {len(body_lines) - max_lines} 行，完整内容见 `tree read \"{rel}\"`]"
+            out.append(f"### 📄 `{rel}` [{eff_date.isoformat()}]")
+            out.append(snippet)
+            out.append("")
+    else:
+        out.append("## 一、常驻核心上下文（L0 Always-On）")
+        out.append("> 🌱 **[SEED_STATE: 幼苗未破土]** 当前 Tree 尚未初始化个人画像与核心底线。")
+        out.append("> 建议宿主 Agent 引导用户 3 选 1 破土：① 运行 `tree seed scan` 迁移本机旧记忆与历史对话；② 提 3 个高杠杆问题口述生成初始幼苗；③ 先干活，边聊边种。")
+        out.append("")
+
+    # 1.5 Situational Auto-Focus & Cross-Branch Resonance (01 <-> 02 <-> 03 <-> 04)
+    if not no_auto_focus and focus_nodes:
+        ws_signal = tree_focus.probe_workspace(root, caller_cwd=caller_cwd, query=query_str)
+        focus_bundle = tree_focus.build_focus_bundle(focus_nodes, ws_signal)
+        focus_lines = tree_focus.format_focus_section(focus_bundle)
+        if focus_lines:
+            out.extend(focus_lines)
+
+    def _fmt_extras(kind: str, location: str) -> str:
+        parts: list[str] = []
+        if kind == "idea":
+            parts.append("💡想法")
+        if location:
+            parts.append(f"📍 `{location}`")
+        return (" " + " ".join(parts)) if parts else ""
+
+    # 2. Auto-Decay Activity Spotlight (computed from updated recency + audit.jsonl usage heat, zero manual tags)
+    hot_items.sort(key=lambda x: (x[0], x[1], x[2].as_posix()), reverse=True)
+    spotlight_lines: list[str] = []
+    for heat_score, eff_date, f, summary, active_days, kind, location in hot_items[:5]:
+        icon = "🔥" if active_days >= 2 else "🕒"
+        heat_tag = f" · 近30天活跃{active_days}天" if active_days >= 2 else ""
+        spotlight_lines.append(
+            f"- {icon} `{f.relative_to(root)}` [{eff_date.isoformat()}{heat_tag}]{_fmt_extras(kind, location)} — {summary}"
+        )
+
+    if spotlight_lines:
+        out.append(f"## 二、近期活跃焦点（按近 {recent_days} 天更新与读写热度自动排序）")
+        out.extend(spotlight_lines)
+        out.append("")
+
+    # 3. Directory map of remaining active on-demand pages across all branches
+    out.append("## 三、知识树全景目录（按需调用 `tree read` 加载具体页面）")
+    current_chars = sum(len(x) + 1 for x in out)
+    budget_exceeded = False
+    for b, active_items, dormant_count, always_in_branch in branch_active_map:
+        b_dir = root / b
+        index_file = b_dir / "INDEX.md"
+        meta_parts: list[str] = []
+        if always_in_branch:
+            meta_parts.append(f"常驻 {always_in_branch} 篇")
+        meta_parts.append(f"按需活跃 {len(active_items)} 篇" if always_in_branch else f"活跃 {len(active_items)} 篇")
+        if dormant_count:
+            meta_parts.append(f"休眠 {dormant_count} 篇")
+        header_line = f"- **{b}/** ({' / '.join(meta_parts)})"
+        out.append(header_line)
+        current_chars += len(header_line) + 1
+        if len(active_items) > 15 and index_file.is_file():
+            rel_idx = index_file.relative_to(root)
+            line = f"  - 🗺️ `{rel_idx}` — 活跃页面较多，请优先精读索引地图或使用 `tree search` 定位"
+            out.append(line)
+            current_chars += len(line) + 1
+        else:
+            shown_in_branch = 0
+            for _heat, eff_date, f, summary, _active_days, _, kind, location in active_items:
+                if current_chars >= DEFAULT_L0_MAX_CHARS and shown_in_branch >= 3:
+                    budget_exceeded = True
+                    remain = len(active_items) - shown_in_branch
+                    line = f"  - *（已达 L0 预算上限，余 {remain} 篇可用 `tree list \"{b}\"` 或 `tree search` 查看）*"
+                    out.append(line)
+                    current_chars += len(line) + 1
+                    break
+                rel = f.relative_to(root)
+                line = f"  - `{rel}` [{eff_date.isoformat()}]{_fmt_extras(kind, location)} — {summary}"
+                out.append(line)
+                current_chars += len(line) + 1
+                shown_in_branch += 1
+        if dormant_count and not (len(active_items) > 15 and index_file.is_file()) and not budget_exceeded:
+            line = f"  - *（另有 {dormant_count} 篇休眠或超过 {stale_days} 天未更新页面，仍可通过 `tree search` 召回）*"
+            out.append(line)
+            current_chars += len(line) + 1
+
+    # 3.5 Seed External Brain & Curated Collections (seed/ directory, lightweight index in L0)
+    if active_seed_items or dormant_seed_count:
+        seed_meta_parts = [f"外脑数据源与精选收藏 {len(active_seed_items)} 篇"]
+        if dormant_seed_count:
+            seed_meta_parts.append(f"休眠 {dormant_seed_count} 篇")
+        out.append(f"- **seed/** ({' / '.join(seed_meta_parts)})")
+        for idx_sf, (sf, sf_date, sf_sum) in enumerate(active_seed_items):
+            if current_chars >= DEFAULT_L0_MAX_CHARS and idx_sf >= 2:
+                out.append(f"  - *（已达 L0 预算上限，余 {len(active_seed_items) - idx_sf} 篇可用 `tree seed status` 查看）*")
+                break
+            sf_rel = sf.relative_to(root)
+            line = f"  - `{sf_rel}` [{sf_date.isoformat()}] — {sf_sum}"
+            out.append(line)
+            current_chars += len(line) + 1
+
+    staged_files = tree_seed.list_staging_files(root)
+    if staged_files:
+        out.append("")
+        out.append(f"> 🌱 采集暂存区 `seed/staging/` 存在 {len(staged_files)} 份待蒸馏素材（查看: `tree seed status` | 读总览: `seed/staging/00-manifest.md`）。")
+
+    print("\n".join(out))
+
+
+def cmd_list(root: Path, args: argparse.Namespace) -> None:
+    target = safe_resolve(root, args.subpath) if args.subpath else root
+    if not target.exists():
+        print(f"❌ 路径不存在: {args.subpath}", file=sys.stderr)
+        sys.exit(1)
+    log_audit(root, "list", args.subpath or "/")
+
+    def fmt_meta(f: Path) -> str:
+        meta, _, eff_date, status, _ = get_page_meta_info(f)
+        tags = [eff_date.isoformat()]
+        if f.name == "SKILL.md":
+            tags.append("🧩skill")
+        if status != "active":
+            tags.append(status)
+        if meta.get("kind"):
+            tags.append(meta["kind"].strip().lower())
+        loc = f" 📍 {meta['location'].strip()}" if meta.get("location") else ""
+        return f"[{' · '.join(tags)}]{loc}"
+
+    if args.subpath:
+        files = _iter_branch_pages(root, target) if target.is_dir() else [target]
+        for f in files:
+            rel = f.relative_to(root)
+            print(f"📄 {rel} {fmt_meta(f)} ({extract_first_summary(f)})")
+    else:
+        for b in [*get_branches(root), "seed"]:
+            b_dir = root / b
+            if not b_dir.exists():
+                continue
+            files = _iter_branch_pages(root, b_dir)
+            icon = "🌱" if b == "seed" else "🌳"
+            print(f"{icon} {b}/ ({len(files)} 篇)")
+            for f in files:
+                rel = f.relative_to(root)
+                print(f"   └── {rel.relative_to(b)} {fmt_meta(f)} — {extract_first_summary(f)}")
+
+
+def cmd_read(root: Path, args: argparse.Namespace) -> None:
+    target = safe_resolve(root, args.path)
+    if not target.exists() or not target.is_file():
+        print(f"❌ 页面不存在: {args.path}", file=sys.stderr)
+        sys.exit(1)
+    rel = str(target.relative_to(root))
+    detail = f"sha256:{get_readme_hash(target)}" if rel.lower() == "readme.md" else ""
+    log_audit(root, "read", rel, agent=args.agent, detail=detail)
+    print(target.read_text(encoding="utf-8"))
+
+
+def extract_custom_rules(readme_text: str) -> list[str]:
+    """Extract user-authored lines under section '五、我的个性化定制规则'."""
+    in_section = False
+    collected: list[str] = []
+    for raw in readme_text.splitlines():
+        line = raw.strip()
+        if not in_section:
+            if re.match(r"^##\s+.*个性化定制规则\s*$", line):
+                in_section = True
+            continue
+        if line.startswith("## ") or line == "---":
+            break
+        if not line or line.startswith(">"):
+            continue
+        if "暂无额外定制" in line:
+            continue
+        collected.append(raw.rstrip())
+    return collected
+
+
+def cmd_rules(root: Path, args: argparse.Namespace) -> None:
+    readme_path = find_readme_path(root)
+    if not readme_path:
+        print("❌ 根目录未找到 README.md 维护准则", file=sys.stderr)
+        sys.exit(1)
+    rel = str(readme_path.relative_to(root))
+    readme_text = readme_path.read_text(encoding="utf-8")
+    log_audit(root, "read", rel, agent=args.agent, detail=f"sha256:{get_readme_hash(readme_path)}")
+    if getattr(args, "full", False):
+        print(readme_text)
+        return
+    branches = get_branches(root)
+    print(COMPACT_RULES_HEADER.rstrip())
+    custom_rules = extract_custom_rules(readme_text)
+    if custom_rules:
+        print("\n## 3. 我的个性化定制规则（最高优先级，来自 README.md 第五节）")
+        for line in custom_rules:
+            print(line)
+    print(f"\n- 当前知识库路径：`{root}` | 启用主干：`{', '.join(branches)}`")
+
+
+def cmd_write(root: Path, args: argparse.Namespace) -> None:
+    agent = _resolve_caller_agent(args.agent)
+    verify_readme_gate(root, agent=agent)
+    rel_clean = args.path.strip().lstrip("/")
+    if not rel_clean.endswith(".md"):
+        rel_clean += ".md"
+    if Path(rel_clean).name.lower() == "readme.md" and "/" in rel_clean:
+        print("❌ 违反园丁契约：正文必须写在具名专页中，禁止写入子目录 README.md", file=sys.stderr)
+        sys.exit(1)
+
+    target = safe_resolve(root, rel_clean)
+    content = sys.stdin.read() if args.stdin else (args.content or "")
+    if not content.strip():
+        print("❌ 写入内容不能为空", file=sys.stderr)
+        sys.exit(1)
+
+    existed = target.exists()
+    is_append = bool(getattr(args, "append", False))
+    is_force = bool(getattr(args, "force", False))
+    if existed and rel_clean.lower() != "readme.md":
+        old_raw = target.read_text(encoding="utf-8")
+        old_meta, old_body = parse_frontmatter(old_raw)
+        if is_human_protected(old_meta, old_body) and not getattr(args, "human_approved", False):
+            print(
+                f"❌ 保护拦截：`{rel_clean}` 标记为人类原创笔记（#note / owner: human），禁止擅自覆写正文。",
+                file=sys.stderr,
+            )
+            print("👉 可从中提炼结论写入旁边的维基词条并建立 [[双链]]；仅在用户明确要求修改该页时附带 --human-approved。", file=sys.stderr)
+            sys.exit(1)
+
+        incoming_meta, incoming_body = parse_frontmatter(content)
+        old_span = _extract_frontmatter_span(old_raw)
+        if is_append:
+            # Preserve existing frontmatter + body and append new snippet cleanly
+            combined_body = f"{old_body.rstrip()}\n\n{incoming_body.strip()}" if old_body.strip() else incoming_body.strip()
+            if old_span:
+                norm_old, fm_end, _ = old_span
+                fm_header = norm_old[: fm_end + 4]
+                content = f"{fm_header}\n\n{combined_body}\n"
+            else:
+                content = combined_body
+        else:
+            if not is_force:
+                old_len = len(old_body.strip())
+                new_len = len(incoming_body.strip())
+                if old_len >= 200 and new_len < old_len * 0.5:
+                    print(
+                        f"❌ 防截断保护拦截：`{rel_clean}` 原文正文 {old_len} 字符，本次写入仅 {new_len} 字符（缩水超过 50%），疑似截断或省略了旧内容。",
+                        file=sys.stderr,
+                    )
+                    print("👉 若仅补充新内容请改用 `--append`；若确需大幅精简或重写整页请附带 `--force`。", file=sys.stderr)
+                    sys.exit(1)
+            # Inherit existing frontmatter block when full-page update omits `---` frontmatter
+            if not incoming_meta and old_meta and old_span:
+                norm_old, fm_end, _ = old_span
+                fm_header = norm_old[: fm_end + 4]
+                content = f"{fm_header}\n\n{incoming_body.strip()}\n"
+    elif existed and rel_clean.lower() == "readme.md":
+        old_raw = target.read_text(encoding="utf-8")
+        if is_append:
+            content = f"{old_raw.rstrip()}\n\n{content.strip()}"
+        elif not is_force:
+            old_len = len(old_raw.strip())
+            new_len = len(content.strip())
+            if old_len >= 200 and new_len < old_len * 0.5:
+                print(
+                    f"❌ 防截断保护拦截：`{rel_clean}` 原文 {old_len} 字符，本次写入仅 {new_len} 字符（缩水超过 50%）。",
+                    file=sys.stderr,
+                )
+                print("👉 若仅补充内容请改用 `--append`；若确需大幅重写请附带 `--force`。", file=sys.stderr)
+                sys.exit(1)
+
+    if rel_clean.lower() != "readme.md":
+        today_str = datetime.datetime.now().date().isoformat()
+        status_arg = getattr(args, "status", "") or ""
+        always_arg: bool | None = None
+        if getattr(args, "always", False):
+            always_arg = True
+        elif getattr(args, "no_always", False):
+            always_arg = False
+        content = upsert_frontmatter(
+            content,
+            today_str,
+            status=status_arg,
+            kind=getattr(args, "kind", "") or "",
+            location=getattr(args, "location", "") or "",
+            when=getattr(args, "when", "") or "",
+            always=always_arg,
+        )
+    else:
+        content = content.rstrip() + "\n"
+
+    atomic_write_text(target, content)
+
+    action = "update" if existed else "create"
+    rel_str = str(target.relative_to(root))
+    reason = args.reason or ("更新上下文页面" if existed else "新增上下文页面")
+
+    meta = ensure_meta_dir(root)
+    append_jsonl(
+        meta / "changelog.jsonl",
+        {
+            "timestamp": now_iso(),
+            "action": action,
+            "path": rel_str,
+            "agent": agent,
+            "reason": reason,
+        },
+    )
+    log_audit(root, f"write:{action}", rel_str, agent=agent, detail=reason)
+    git_ok, git_err = git_commit_change(root, rel_str, action, reason, agent)
+    if git_ok:
+        print(f"✅ 已{'更新' if existed else '创建'} `{rel_str}` 并完成 Git 版本提交 ({reason})")
+    else:
+        print(f"✅ 已{'更新' if existed else '创建'} `{rel_str}`（⚠️ Git 提交失败: {git_err}）", file=sys.stderr)
+    auto_refresh_global_instructions_if_mounted(root)
+
+    if rel_str.lower() != "readme.md":
+        written_meta, _ = parse_frontmatter(content)
+        parts = Path(rel_str).parts
+        top_branch = parts[0] if parts else ""
+        branches = get_branches(root)
+        identity_set = set(get_identity_branches(root, branches))
+        if top_branch in identity_set and "always" not in written_meta:
+            other_always = [
+                f for f in (root / top_branch).rglob("*.md")
+                if f.name.lower() != "readme.md" and f.resolve() != target.resolve()
+                and is_always_loaded(get_page_meta_info(f)[0], top_branch, identity_set)
+            ]
+            if other_always:
+                print("💡 提示：该页未显式标记 `always`，当前会整段加载进 L0；若仅需按需读取（如人际/环境资产），建议补充 `--no-always`")
+        if top_branch.startswith("03-") and not written_meta.get("kind"):
+            print("💡 提示：03 专页建议补充 `--kind idea` 或 `--kind project --location \"<外部路径或链接>\"`")
+
+
+def cmd_delete(root: Path, args: argparse.Namespace) -> None:
+    agent = _resolve_caller_agent(args.agent)
+    verify_readme_gate(root, agent=agent)
+    target = safe_resolve(root, args.path)
+    if not target.exists():
+        print(f"❌ 路径不存在: {args.path}", file=sys.stderr)
+        sys.exit(1)
+    if target.is_dir():
+        print(f"❌ 不支持直接删除目录: `{args.path}`，请逐页指定文件或使用 `tree move`", file=sys.stderr)
+        sys.exit(1)
+    rel_str = str(target.relative_to(root))
+    if rel_str in get_branches(root) or rel_str.lower() == "readme.md":
+        print("❌ 严禁删除一级主干目录或根契约", file=sys.stderr)
+        sys.exit(1)
+    if target.is_file():
+        old_meta, old_body = parse_frontmatter(target.read_text(encoding="utf-8"))
+        if is_human_protected(old_meta, old_body) and not getattr(args, "human_approved", False):
+            print(
+                f"❌ 保护拦截：`{rel_str}` 标记为人类原创笔记（#note / owner: human），禁止擅自删除。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    target.unlink()
+    reason = args.reason or "修剪过期或已合并页面"
+    meta = ensure_meta_dir(root)
+    append_jsonl(
+        meta / "changelog.jsonl",
+        {
+            "timestamp": now_iso(),
+            "action": "delete",
+            "path": rel_str,
+            "agent": agent,
+            "reason": reason,
+        },
+    )
+    log_audit(root, "delete", rel_str, agent=agent, detail=reason)
+    git_ok, git_err = git_commit_change(root, rel_str, "delete", reason, agent)
+    if git_ok:
+        print(f"🗑️ 已修剪删除 `{rel_str}` 并记录 Git 版本历史")
+    else:
+        print(f"🗑️ 已修剪删除 `{rel_str}`（⚠️ Git 提交失败: {git_err}）", file=sys.stderr)
+    auto_refresh_global_instructions_if_mounted(root)
+
+
+def _replace_wikilinks(root: Path, src_rel: str, dst_rel: str) -> list[str]:
+    """Update path-based and stem-based [[wikilinks]] across non-protected Markdown pages after a move."""
+    src_no_ext = src_rel[:-3] if src_rel.endswith(".md") else src_rel
+    dst_no_ext = dst_rel[:-3] if dst_rel.endswith(".md") else dst_rel
+    src_path = Path(src_no_ext)
+    dst_path = Path(dst_no_ext)
+    pairs: list[tuple[str, str]] = [(src_rel, dst_rel), (src_no_ext, dst_no_ext)]
+    if len(src_path.parts) >= 2 and len(dst_path.parts) >= 2:
+        src_short = f"{src_path.parts[-2]}/{src_path.name}"
+        dst_short = f"{dst_path.parts[-2]}/{dst_path.name}"
+        if src_short != dst_short:
+            pairs.append((src_short, dst_short))
+        if src_path.name != dst_path.name:
+            # Prefer disambiguated Parent/Stem link when target stem is generic (e.g. 项目总览)
+            target_link = dst_short if dst_path.name in {"项目总览", "总览", "概览"} else dst_path.name
+            pairs.append((src_path.name, target_link))
+    elif src_path.name != dst_path.name:
+        pairs.append((src_path.name, dst_path.name))
+    updated_files: list[str] = []
+    for branch in [*get_branches(root), "seed"]:
+        b_dir = root / branch
+        if not b_dir.exists():
+            continue
+        for md in _iter_branch_pages(root, b_dir):
+            try:
+                text = md.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            meta, body = parse_frontmatter(text)
+            if is_human_protected(meta, body):
+                continue
+            new_text = text
+            for old_ref, new_ref in pairs:
+                new_text = new_text.replace(f"[[{old_ref}]]", f"[[{new_ref}]]")
+                new_text = new_text.replace(f"[[{old_ref}|", f"[[{new_ref}|")
+            if new_text != text:
+                atomic_write_text(md, new_text)
+                updated_files.append(str(md.relative_to(root)))
+    return updated_files
+
+
+def cmd_move(root: Path, args: argparse.Namespace) -> None:
+    agent = _resolve_caller_agent(args.agent)
+    verify_readme_gate(root, agent=agent)
+    src_clean = args.src.strip().lstrip("/")
+    src = safe_resolve(root, src_clean)
+    if not src.exists() and not src_clean.endswith(".md"):
+        src_clean += ".md"
+        src = safe_resolve(root, src_clean)
+    if not src.exists() or not src.is_file():
+        print(f"❌ 源文件不存在或不是文件: {args.src}", file=sys.stderr)
+        sys.exit(1)
+
+    src_rel = str(src.relative_to(root))
+    if src_rel in get_branches(root) or src_rel.lower() == "readme.md":
+        print("❌ 严禁移动一级主干目录或根契约 README.md", file=sys.stderr)
+        sys.exit(1)
+
+    dst_clean = args.dst.strip().lstrip("/")
+    if not dst_clean.endswith(".md"):
+        dst_clean += ".md"
+    if Path(dst_clean).name.lower() == "readme.md":
+        print("❌ 违反园丁契约：禁止移动或写入子目录 README.md", file=sys.stderr)
+        sys.exit(1)
+    dst = safe_resolve(root, dst_clean)
+    if dst.resolve() == src.resolve():
+        print("ℹ️ 源路径与目标路径相同，无需移动。")
+        return
+
+    old_meta, old_body = parse_frontmatter(src.read_text(encoding="utf-8"))
+    if is_human_protected(old_meta, old_body) and not getattr(args, "human_approved", False):
+        print(
+            f"❌ 保护拦截：`{src_rel}` 标记为人类原创笔记（#note / owner: human），禁止擅自重命名或移动。",
+            file=sys.stderr,
+        )
+        print("👉 仅在用户明确要求移动该页时附带 --human-approved。", file=sys.stderr)
+        sys.exit(1)
+
+    if dst.exists() and not getattr(args, "force", False):
+        print(f"❌ 目标路径已存在: `{dst.relative_to(root)}`（如需覆盖请加 --force）", file=sys.stderr)
+        sys.exit(1)
+    if dst.exists():
+        if dst.is_dir():
+            print(f"❌ 目标路径是目录，无法覆盖: `{dst.relative_to(root)}`", file=sys.stderr)
+            sys.exit(1)
+        dst_meta, dst_body = parse_frontmatter(dst.read_text(encoding="utf-8"))
+        if is_human_protected(dst_meta, dst_body) and not getattr(args, "human_approved", False):
+            print(f"❌ 保护拦截：目标 `{dst.relative_to(root)}` 为人类原创笔记，禁止覆盖。", file=sys.stderr)
+            sys.exit(1)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    src.rename(dst)
+    dst_rel = str(dst.relative_to(root))
+
+    link_updates = _replace_wikilinks(root, src_rel, dst_rel)
+
+    reason = args.reason or "重命名或迁移上下文页面"
+    meta = ensure_meta_dir(root)
+    append_jsonl(
+        meta / "changelog.jsonl",
+        {
+            "timestamp": now_iso(),
+            "action": "move",
+            "path": f"{src_rel} -> {dst_rel}",
+            "agent": agent,
+            "reason": reason,
+        },
+    )
+    log_audit(root, "move", f"{src_rel} -> {dst_rel}", agent=agent, detail=reason)
+
+    git_ok, git_err = git_commit_change(root, [src_rel, dst_rel, *link_updates], "move", reason, agent)
+    if git_ok:
+        print(f"✅ 已移动 `{src_rel}` -> `{dst_rel}` 并完成 Git 提交 ({reason})")
+    else:
+        print(f"✅ 已移动 `{src_rel}` -> `{dst_rel}`（⚠️ Git 提交失败: {git_err}）", file=sys.stderr)
+    if link_updates:
+        print(f"🔗 已同步更新 {len(link_updates)} 个关联页面中的 [[双链]]")
+    auto_refresh_global_instructions_if_mounted(root)
+
+
+def cmd_recent(root: Path, args: argparse.Namespace) -> None:
+    """Dynamically filter recent active thoughts/work by updated recency & audit usage heat."""
+    days = args.days if args.days is not None else get_l0_recent_days(root)
+    stale_days = get_l0_stale_days(root)
+    log_audit(root, "recent", f"days={days}")
+    branches = get_branches(root)
+    identity_set = set(get_identity_branches(root, branches))
+    l0_excluded = get_l0_excluded(root)
+    usage_window = days if days > 0 else HEAT_AUDIT_WINDOW_DAYS
+    usage_map = load_recent_audit_usage(root, window_days=usage_window)
+
+    rows: list[tuple[float, datetime.date, str, int, str]] = []
+    for b in branches:
+        if b in l0_excluded:
+            continue
+        b_dir = root / b
+        if not b_dir.exists():
+            continue
+        for f in _iter_branch_pages(root, b_dir):
+            meta, _body, eff_date, status, age_days = get_page_meta_info(f)
+            if status in DORMANT_STATUSES or age_days > stale_days or is_always_loaded(meta, b, identity_set):
+                continue
+            rel = str(f.relative_to(root))
+            kind = (meta.get("kind") or "").strip().lower()
+            heat_score, active_days = compute_page_heat(rel, age_days, kind, usage_map)
+            if days > 0 and age_days > days and active_days == 0:
+                continue
+            rows.append((heat_score, eff_date, rel, active_days, extract_first_summary(f)))
+
+    rows.sort(key=lambda r: (r[0], r[1], r[2]), reverse=True)
+    title = (
+        f"🕒 最近 {days} 天活跃焦点（按更新与读写热度排序）"
+        if days > 0
+        else f"🕒 全部活跃页面（{stale_days} 天内，按热度排序）"
+    )
+    print(f"{title}（共 {len(rows)} 篇）:\n")
+    if not rows:
+        print("  (暂无符合条件的活跃页面)")
+        return
+    for _heat, eff_date, rel, active_days, summary in rows:
+        icon = "🔥" if active_days >= 2 else "🕒"
+        htag = f" · 活跃{active_days}天" if active_days >= 2 else ""
+        print(f"  {icon} {rel} [{eff_date.isoformat()}{htag}] — {summary}")
+
+
+def _has_tag(meta: dict[str, str], body: str, tag_query: str) -> bool:
+    """Return whether a page has the given tag in frontmatter `tags` or inline `#tag`."""
+    needle = tag_query.strip().lstrip("#").lower()
+    if not needle:
+        return True
+    tags_raw = meta.get("tags", "").strip().lower()
+    if tags_raw:
+        tokens = [t.strip(" []'\"#") for t in re.split(r"[,，\s]+", tags_raw) if t.strip()]
+        if needle in tokens:
+            return True
+    return bool(re.search(rf"(?:^|\s)#{re.escape(needle)}(?:\s|$)", body, re.MULTILINE | re.IGNORECASE))
+
+
+def cmd_search(root: Path, args: argparse.Namespace) -> None:
+    q = (getattr(args, "query", "") or "").strip().lower()
+    kind_f = (getattr(args, "kind", "") or "").strip().lower()
+    status_f = (getattr(args, "status", "") or "").strip().lower()
+    tag_f = (getattr(args, "tag", "") or "").strip().lower()
+    always_f = (getattr(args, "always", "") or "").strip().lower()
+    owner_f = (getattr(args, "owner", "") or "").strip().lower()
+    branch_f = (getattr(args, "branch", "") or "").strip().lower()
+
+    if not any([q, kind_f, status_f, tag_f, always_f, owner_f, branch_f]):
+        print("❌ 请提供搜索关键词或至少一个元数据筛选参数（如 `--kind idea` / `--status archived` / `--tag note`）。", file=sys.stderr)
+        sys.exit(1)
+
+    log_audit(
+        root,
+        "search",
+        q or "*",
+        detail=f"kind={kind_f},status={status_f},tag={tag_f},always={always_f},owner={owner_f},branch={branch_f}",
+    )
+    branches = get_branches(root)
+    identity_set = set(get_identity_branches(root, branches))
+    matches: list[tuple[datetime.date, str, list[str], str, str]] = []
+    searchable_branches = [*branches, "seed"] if (root / "seed").is_dir() else list(branches)
+
+    for b in searchable_branches:
+        if branch_f and not b.lower().startswith(branch_f):
+            continue
+        b_dir = root / b
+        if not b_dir.exists():
+            continue
+        for f in _iter_branch_pages(root, b_dir, include_readme=True):
+            if f.name.lower() == "readme.md" and not q:
+                continue
+            text = f.read_text(encoding="utf-8")
+            meta, body, eff_date, status, _ = get_page_meta_info(f, text)
+            if kind_f and (meta.get("kind") or "").strip().lower() != kind_f:
+                continue
+            if status_f and status != status_f:
+                continue
+            if tag_f and not _has_tag(meta, body, tag_f):
+                continue
+            if always_f:
+                want_always = always_f == "true"
+                if is_always_loaded(meta, b, identity_set) != want_always:
+                    continue
+            if owner_f and (meta.get("owner") or "").strip().lower() != owner_f:
+                continue
+            if q and q not in f.name.lower() and q not in text.lower():
+                continue
+
+            rel = str(f.relative_to(root))
+            badges = [eff_date.isoformat()]
+            if status != "active":
+                badges.append(status)
+            if meta.get("kind"):
+                badges.append(meta["kind"].strip().lower())
+            if meta.get("location"):
+                badges.append(f"📍 {meta['location'].strip()}")
+            tag = "[" + " · ".join(badges) + "]"
+
+            lines_hit = (
+                [
+                    f"   L{idx}: {line.strip()[:100]}"
+                    for idx, line in enumerate(text.splitlines(), 1)
+                    if q in line.lower()
+                ]
+                if q
+                else []
+            )
+            summary = "" if lines_hit else extract_first_summary(f)
+            matches.append((eff_date, rel, lines_hit, tag, summary))
+
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _, rel, lines_hit, tag, summary in matches:
+        tail = f" — {summary}" if summary else ""
+        print(f"🔍 {rel} {tag}{tail}")
+        for lh in lines_hit:
+            print(lh)
+    if not matches:
+        print("未找到符合条件的上下文专页。")
+
+
+def cmd_lint(root: Path, _args: argparse.Namespace) -> None:
+    """Audit knowledge tree health: empty dirs, fragment names, diary tone, secrets, duplicate filenames."""
+    reconciled = auto_reconcile_external_file_edits(root)
+    if reconciled:
+        print(f"🔄 已自动收拢并 Git 提交 {len(reconciled)} 处未提交的专页改动: {', '.join(reconciled)}\n")
+    log_audit(root, "lint", "/")
+    branches = get_branches(root)
+    warnings: list[str] = []
+    errors: list[str] = []
+    stem_locations: dict[str, list[str]] = {}
+
+    fragment_re = re.compile(r"(补充|其他|讨论记录|方案\d+|最新)\.md$")
+    diary_patterns = ("用户在对话中", "用户提到", "用户表示", "本次对话中", "对话记录显示")
+    lint_branches = [*branches, "seed"] if (root / "seed").is_dir() else list(branches)
+
+    for b in lint_branches:
+        b_dir = root / b
+        if not b_dir.exists():
+            continue
+        # Empty subdirectories
+        for d in sorted(p for p in b_dir.rglob("*") if p.is_dir()):
+            if b == "seed" and d.relative_to(b_dir).parts[0] in {"staging", "connectors"}:
+                continue
+            if not any(d.iterdir()):
+                warnings.append(f"[空目录] `{d.relative_to(root)}` 为空目录，建议清理")
+
+        for f in _iter_branch_pages(root, b_dir, include_readme=True):
+            rel = str(f.relative_to(root))
+            if f.name.lower() == "readme.md":
+                errors.append(f"[子目录 README] `{rel}` 违反契约：正文不可写在子目录 README.md")
+                continue
+            is_skill_entry = (f.name == "SKILL.md")
+            if not is_skill_entry:
+                rel_parts = Path(rel).parts
+                # Files inside a dedicated 3rd-level project/topic subfolder (e.g. 03-我正在做的事/工作/Eden/项目总览.md)
+                # are namespaced by their parent folder (`Eden/项目总览`) so clean short filenames don't collide.
+                stem_key = f"{rel_parts[-2]}/{f.stem}" if len(rel_parts) >= 4 else f.stem
+                stem_locations.setdefault(stem_key, []).append(rel)
+            if fragment_re.search(f.name):
+                warnings.append(f"[碎片命名] `{rel}` 疑似临时碎片文件，建议原地融合到主专页")
+
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            _, body = parse_frontmatter(text)
+            non_empty = [ln for ln in body.splitlines() if ln.strip()]
+            if len(non_empty) < 3:
+                warnings.append(f"[过短页面] `{rel}` 仅 {len(non_empty)} 行有效内容，疑似碎片短页")
+            elif len(body.splitlines()) > 300:
+                warnings.append(f"[超长页面] `{rel}` 达 {len(body.splitlines())} 行，若主题分叉建议拆分互链")
+
+            for kw in diary_patterns:
+                if kw in body:
+                    warnings.append(f"[记账腔] `{rel}` 出现「{kw}」，请改为第一人称或客观陈述")
+                    break
+
+            for pat, _ in tree_seed.SECRET_PATTERNS:
+                if pat.search(text):
+                    errors.append(f"[敏感密钥] `{rel}` 疑似包含明文密钥/Token，请立即脱敏")
+                    break
+
+    for stem, paths in sorted(stem_locations.items()):
+        if len(paths) > 1 and stem.upper() != "INDEX":
+            warnings.append(f"[同名冲突] `{stem}.md` 在多处重复出现（{', '.join(paths)}），易导致标签页与 [[双链]] 歧义")
+
+    print("🩺 Tree 健康度体检报告：")
+    if not errors and not warnings:
+        print("  ✅ 0 error / 0 warning — 知识树结构健康。")
+        return
+    for e in errors:
+        print(f"  ❌ {e}")
+    for w in warnings:
+        print(f"  ⚠️ {w}")
+    print(f"\n总计：{len(errors)} error(s), {len(warnings)} warning(s)")
+    if errors:
+        sys.exit(1)
+
+
+def cmd_diff(root: Path, args: argparse.Namespace) -> None:
+    """Show Git diff for a specific commit/range or the latest cognitive change."""
+    if not (root / ".git").exists():
+        print("❌ 当前目录尚未初始化 Git 仓库", file=sys.stderr)
+        sys.exit(1)
+    ref = getattr(args, "ref", "") or ""
+    log_audit(root, "diff", ref or "HEAD")
+    if ref:
+        res = git_run(root, ["show", "--stat", "-p", ref])
+    else:
+        status = git_run(root, ["status", "--porcelain"]).stdout.strip()
+        if status:
+            res = git_run(root, ["diff"])
+        else:
+            res = git_run(root, ["show", "--stat", "-p", "HEAD"])
+    if res.returncode != 0:
+        print(res.stderr.strip() or "❌ git diff 执行失败", file=sys.stderr)
+        sys.exit(res.returncode)
+    print(res.stdout or "(无变更差异)")
+
+
+def cmd_revert(root: Path, args: argparse.Namespace) -> None:
+    """Safely revert a specific Git commit in Tree history."""
+    agent = _resolve_caller_agent(getattr(args, "agent", ""))
+    verify_readme_gate(root, agent=agent)
+    if not (root / ".git").exists():
+        print("❌ 当前目录尚未初始化 Git 仓库", file=sys.stderr)
+        sys.exit(1)
+    commit = args.commit.strip()
+    res = git_run(root, ["revert", "--no-edit", commit])
+    if res.returncode != 0:
+        print(f"❌ 回滚 `{commit}` 失败：{res.stderr.strip()}", file=sys.stderr)
+        sys.exit(res.returncode)
+    log_audit(root, "revert", commit, agent=agent)
+    print(f"⏪ 已安全回滚提交 `{commit}` 并生成新版本记录。")
+    auto_refresh_global_instructions_if_mounted(root)
+
+
+def cmd_log(root: Path, args: argparse.Namespace) -> None:
+    res = git_run(root, ["log", f"-n{args.limit}", "--pretty=format:%h  %ad  %s", "--date=short"])
+    if res.stdout:
+        print("📜 Tree 认知演进历史 (Git Commits):")
+        print(res.stdout)
+    audit_path = root / ".tree" / "audit.jsonl"
+    if args.audit and audit_path.exists():
+        print("\n🛡️ 最近 Agent 访问与读写审计 (.tree/audit.jsonl):")
+        lines = audit_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-args.limit :]
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                print(
+                    f"  [{rec.get('timestamp', '-')}] {rec.get('agent', '-')} -> "
+                    f"{rec.get('action', '-')} ({rec.get('target', '-')}) {rec.get('detail', '')}"
+                )
+            except Exception:
+                continue
+
+
+def _sync_gitignore_entries(root: Path, entries: tuple[str, ...]) -> None:
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("\n".join(entries) + "\n", encoding="utf-8")
+        return
+    content = gitignore.read_text(encoding="utf-8")
+    existing_lines = {ln.strip() for ln in content.splitlines()}
+    missing = [entry for entry in entries if entry not in existing_lines]
+    if missing:
+        sep = "" if content.endswith("\n") or not content else "\n"
+        gitignore.write_text(content + sep + "\n".join(missing) + "\n", encoding="utf-8")
+
+
+def _ensure_sync_gitignore(root: Path) -> None:
+    entries: list[str] = [
+        ".DS_Store",
+        ".tree/audit.jsonl",
+        ".tree/sync.log",
+        "outputs/",
+    ]
+    if (root / "bin").exists():
+        entries.append("bin/__pycache__/")
+    entries.extend([
+        "seed/staging/",
+        "seed/connectors/",
+        "seed/sources.json",
+    ])
+    gitignore = root / ".gitignore"
+    existing = {ln.strip() for ln in gitignore.read_text(encoding="utf-8").splitlines()} if gitignore.is_file() else set()
+    if "seed/图片与审美/*" not in existing and "seed/图片与审美/**/*" not in existing:
+        entries.extend([
+            "seed/图片与审美/**/*",
+            "!seed/图片与审美/**/",
+            "!seed/图片与审美/**/*.md",
+        ])
+    _sync_gitignore_entries(root, tuple(entries))
+
+
+def _launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / "com.tree.autosync.plist"
+
+
+def _sync_schedule_status(root: Path) -> tuple[bool, str]:
+    if sys.platform == "darwin":
+        plist_path = _launchd_plist_path()
+        if not plist_path.exists():
+            return False, "未配置每日定时同步（macOS launchd）"
+        import plistlib
+        try:
+            data = plistlib.loads(plist_path.read_bytes())
+            cal = data.get("StartCalendarInterval", {})
+            hh = int(cal.get("Hour", 23))
+            mm = int(cal.get("Minute", 0))
+            return True, f"已开启每日 {hh:02d}:{mm:02d} 自动同步（launchd: {plist_path}）"
+        except Exception:
+            return True, f"已存在定时配置（{plist_path}）"
+    res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if res.returncode == 0:
+        marker = f"# tree-autosync:{root}"
+        for line in res.stdout.splitlines():
+            if marker in line:
+                return True, f"已开启每日定时同步（crontab: {line}）"
+    return False, "未配置每日定时同步（crontab）"
+
+
+def cmd_remote(root: Path, args: argparse.Namespace) -> None:
+    if not (root / ".git").exists():
+        git_run(root, ["init", "-q"])
+    name = args.name.strip() or "origin"
+
+    if args.remove:
+        res = git_run(root, ["remote", "remove", name])
+        if res.returncode != 0:
+            print(f"❌ 移除远端 `{name}` 失败: {res.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ 已移除远端仓库 `{name}`")
+        return
+
+    if not args.url:
+        res = git_run(root, ["remote", "-v"])
+        remotes = (res.stdout or "").strip()
+        if remotes:
+            print("当前绑定的远端仓库：")
+            print(remotes)
+        else:
+            print("ℹ️ 当前为纯本地模式，尚未绑定 GitHub / GitLab 远端仓库。")
+            print("👉 绑定示例: tree remote git@github.com:<你的用户名>/my-tree.git")
+        _, sched_msg = _sync_schedule_status(root)
+        print(f"定时同步状态: {sched_msg}")
+        return
+
+    url = args.url.strip()
+    existing = git_run(root, ["remote", "get-url", name])
+    if existing.returncode == 0:
+        res = git_run(root, ["remote", "set-url", name, url])
+        action_label = "更新"
+    else:
+        res = git_run(root, ["remote", "add", name, url])
+        action_label = "绑定"
+    if res.returncode != 0:
+        print(f"❌ {action_label}远端 `{name}` 失败: {res.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    _ensure_sync_gitignore(root)
+    log_audit(root, "remote", name, detail=url)
+    print(f"✅ 已{action_label}远端仓库 `{name}` -> {url}")
+    print("⚠️ 安全提醒：请务必确认该 GitHub / GitLab 仓库为 Private（私有），避免个人上下文泄露至公网。")
+    print("👉 立即同步: tree sync")
+    print("👉 开启每日定时同步: tree sync schedule --enable --time 23:00")
+
+
+def cmd_sync(root: Path, args: argparse.Namespace) -> None:
+    if not (root / ".git").exists():
+        print("ℹ️ 当前目录尚未初始化 Git 仓库，跳过远程同步。")
+        return
+
+    remote = args.remote.strip() or "origin"
+    remote_check = git_run(root, ["remote", "get-url", remote])
+    if remote_check.returncode != 0:
+        print(f"ℹ️ 当前为纯本地模式，未配置远端 `{remote}`（可用 `tree remote <私有仓库URL>` 绑定）。")
+        return
+
+    _ensure_sync_gitignore(root)
+
+    status_res = git_run(root, ["status", "--porcelain"])
+    dirty = bool((status_res.stdout or "").strip())
+    if dirty:
+        if args.dry_run:
+            print("[dry-run] 检测到本地未提交改动，将自动执行 git add -A && git commit")
+        else:
+            git_run(root, ["add", "-A"])
+            git_run(root, ["commit", "-q", "-m", "tree(sync): 自动提交本地变更"])
+
+    branch = args.branch.strip()
+    if not branch:
+        br_res = git_run(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+        branch = (br_res.stdout or "").strip()
+        if not branch or branch == "HEAD":
+            branch = "main"
+
+    if args.dry_run:
+        print(f"[dry-run] 将同步分支 `{branch}` 至远端 `{remote}` ({remote_check.stdout.strip()})")
+        return
+
+    ls_res = git_run(root, ["ls-remote", "--heads", remote, branch])
+    if ls_res.returncode == 0 and (ls_res.stdout or "").strip():
+        pull_res = git_run(root, ["pull", "--rebase", remote, branch])
+        if pull_res.returncode != 0:
+            git_run(root, ["rebase", "--abort"])
+            print(
+                f"❌ 远程同步冲突（已自动中止 rebase，本地数据未受损）:\n{pull_res.stderr.strip()}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    push_res = git_run(root, ["push", "-u", remote, branch])
+    if push_res.returncode != 0:
+        print(f"❌ 推送至 `{remote}/{branch}` 失败:\n{push_res.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    log_audit(root, "sync", remote, detail=branch)
+    print(f"✅ [{now_iso()}] 已完成远程同步 -> {remote}/{branch}")
+
+
+def cmd_sync_schedule(root: Path, args: argparse.Namespace) -> None:
+    if args.disable:
+        if sys.platform == "darwin":
+            plist_path = _launchd_plist_path()
+            uid = os.getuid()
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist_path)], capture_output=True)
+            subprocess.run(["launchctl", "unload", "-w", str(plist_path)], capture_output=True)
+            if plist_path.exists():
+                plist_path.unlink()
+            print("✅ 已关闭每日定时自动同步（macOS launchd）")
+            return
+        res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        if res.returncode == 0:
+            marker = f"# tree-autosync:{root}"
+            kept = [line for line in res.stdout.splitlines() if marker not in line]
+            new_cron = "\n".join(kept) + ("\n" if kept else "")
+            subprocess.run(["crontab", "-"], input=new_cron, text=True, check=False)
+        print("✅ 已关闭每日定时自动同步（crontab）")
+        return
+
+    if args.enable:
+        m = re.match(r"^(\d{1,2}):(\d{2})$", args.time.strip())
+        if not m:
+            print("❌ 时间格式无效，请使用 HH:MM（例如 23:00）", file=sys.stderr)
+            sys.exit(1)
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            print("❌ 时间超出范围（小时 0-23，分钟 0-59）", file=sys.stderr)
+            sys.exit(1)
+
+        _ensure_sync_gitignore(root)
+        ensure_meta_dir(root)
+        script_path = Path(__file__).resolve()
+
+        if sys.platform == "darwin":
+            import plistlib
+            plist_path = _launchd_plist_path()
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path = root / ".tree" / "sync.log"
+            plist_data = {
+                "Label": "com.tree.autosync",
+                "ProgramArguments": [sys.executable, str(script_path), "sync"],
+                "WorkingDirectory": str(root),
+                "EnvironmentVariables": {
+                    "TREE_HOME": str(root),
+                    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                },
+                "StartCalendarInterval": {"Hour": hour, "Minute": minute},
+                "StandardOutPath": str(log_path),
+                "StandardErrorPath": str(log_path),
+            }
+            plist_path.write_bytes(plistlib.dumps(plist_data))
+            uid = os.getuid()
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist_path)], capture_output=True)
+            boot_res = subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
+                capture_output=True,
+                text=True,
+            )
+            if boot_res.returncode != 0:
+                subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True)
+            print(f"✅ 已开启每日 {hour:02d}:{minute:02d} 自动远程同步（macOS launchd）")
+            print(f"   配置文件: {plist_path}")
+            print(f"   同步日志: {log_path}")
+        else:
+            log_path = root / ".tree" / "sync.log"
+            marker = f"# tree-autosync:{root}"
+            cron_line = f"{minute} {hour} * * * TREE_HOME=\"{root}\" \"{sys.executable}\" \"{script_path}\" sync >> \"{log_path}\" 2>&1 {marker}"
+            res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+            existing_lines = res.stdout.splitlines() if res.returncode == 0 else []
+            kept = [line for line in existing_lines if marker not in line]
+            kept.append(cron_line)
+            new_cron = "\n".join(kept) + "\n"
+            proc = subprocess.run(["crontab", "-"], input=new_cron, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"❌ 写入 crontab 失败: {proc.stderr.strip()}", file=sys.stderr)
+                sys.exit(1)
+            print(f"✅ 已开启每日 {hour:02d}:{minute:02d} 自动远程同步（crontab）")
+
+        remote_check = git_run(root, ["remote", "get-url", "origin"])
+        if remote_check.returncode != 0:
+            print("⚠️ 提示：当前尚未绑定 `origin` 远端仓库，请再执行 `tree remote <私有仓库URL>` 完成绑定。")
+        return
+
+    _, msg = _sync_schedule_status(root)
+    print(msg)
+
+
+DAILY_ALLOWED_STATUSES = {"ready", "reviewed"}
+DAILY_ALLOWED_SOURCES = {
+    "GitHub", "即刻", "小宇宙", "X", "B站", "知乎",
+    "博客", "论文", "社区", "播客", "视频", "报告", "产品", "新闻",
+}
+DAILY_STATUS_RANK = {"reviewed": 2, "ready": 1}
+
+
+def _daily_dir(root: Path) -> Path:
+    return root / "outputs" / "daily"
+
+
+def _parse_daily_date(filename: str) -> datetime.date | None:
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[-_\s.]|$)", filename)
+    if not m:
+        return None
+    try:
+        return datetime.date.fromisoformat(m.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_daily_theme_from_stem(stem: str) -> str:
+    return re.sub(r"^\d{4}-\d{2}-\d{2}[-_\s]*", "", stem).strip()
+
+
+def _sanitize_daily_theme(theme: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\s]+', "", theme.strip())
+    return cleaned[:24] if cleaned else "每日简报"
+
+
+def _list_daily_files(root: Path) -> list[Path]:
+    d_dir = _daily_dir(root)
+    if not d_dir.is_dir():
+        return []
+    entries: list[tuple[datetime.date, int, float, Path]] = []
+    for f in d_dir.glob("*.md"):
+        if not f.is_file():
+            continue
+        d = _parse_daily_date(f.name)
+        if d is None:
+            continue
+        meta, _ = parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
+        status_rank = DAILY_STATUS_RANK.get((meta.get("status") or "").strip().lower(), 0)
+        try:
+            mtime = f.stat().st_mtime
+        except Exception:
+            mtime = 0.0
+        entries.append((d, status_rank, mtime, f))
+    entries.sort(key=lambda item: (item[0], item[1], item[2], item[3].name), reverse=True)
+    return [item[3] for item in entries]
+
+
+def _normalize_feed_url(url: str) -> str:
+    """Normalize URL for stable cross-day deduplication (lowercase host, strip utm_* & trailing slash)."""
+    cleaned = url.strip().rstrip(".,;")
+    try:
+        parsed = urllib.parse.urlsplit(cleaned)
+        if not parsed.scheme or not parsed.netloc:
+            return cleaned
+        q_pairs = [
+            (k, v)
+            for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if not k.lower().startswith("utm_")
+        ]
+        norm_path = parsed.path.rstrip("/") or "/"
+        norm_query = urllib.parse.urlencode(q_pairs)
+        return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), norm_path, norm_query, ""))
+    except Exception:
+        return cleaned
+
+
+def _extract_markdown_urls(text: str) -> list[str]:
+    """Extract URLs from Markdown `[label](https://...)` links (supports balanced parentheses in URLs)."""
+    urls: list[str] = []
+    idx = 0
+    while True:
+        pos = text.find("](http", idx)
+        if pos < 0:
+            break
+        start = pos + 2
+        depth = 0
+        j = start
+        while j < len(text):
+            ch = text[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch.isspace():
+                break
+            j += 1
+        raw_u = text[start:j].strip()
+        if raw_u.startswith(("http://", "https://")):
+            urls.append(raw_u)
+        idx = j + 1
+    return urls
+
+
+def _extract_section_lines(body: str, heading: str) -> tuple[bool, list[tuple[int, str]]]:
+    """Return (found, list[(line_no, raw_line)]) for a top-level `## <heading>` section until next `##` or `---`."""
+    lines = body.replace("\r\n", "\n").splitlines()
+    in_sec = False
+    found = False
+    out: list[tuple[int, str]] = []
+    target_h = f"## {heading}"
+    for idx, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if re.match(r"^##\s+", stripped):
+            if stripped == target_h:
+                in_sec = True
+                found = True
+            else:
+                in_sec = False
+            continue
+        if in_sec:
+            if stripped == "---":
+                in_sec = False
+                continue
+            out.append((idx, raw))
+    return found, out
+
+
+def _extract_feed_items_from_body(body: str) -> tuple[bool, list[dict]]:
+    """Parse `## 今日专属 Feed` cards strictly for linting and deduplication."""
+    lines = body.replace("\r\n", "\n").splitlines()
+    in_feed = False
+    has_feed_section = False
+    cards: list[dict] = []
+    current: dict | None = None
+
+    for idx, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if re.match(r"^##\s+", stripped):
+            if stripped == "## 今日专属 Feed":
+                in_feed = True
+                has_feed_section = True
+            else:
+                if in_feed and current is not None:
+                    cards.append(current)
+                    current = None
+                in_feed = False
+            continue
+        if not in_feed:
+            continue
+        if stripped == "---":
+            if current is not None:
+                cards.append(current)
+                current = None
+            in_feed = False
+            continue
+        m_h3 = re.match(r"^###\s+(\d+)\.\s+\[([^\]]+)\]\s+(.+)$", stripped)
+        if m_h3:
+            if current is not None:
+                cards.append(current)
+            current = {
+                "line": idx,
+                "num": int(m_h3.group(1)),
+                "source": m_h3.group(2).strip(),
+                "title": m_h3.group(3).strip(),
+                "fields": {},
+                "dup_fields": [],
+                "extra_lines": [],
+            }
+            continue
+        if stripped.startswith("### "):
+            if current is not None:
+                cards.append(current)
+            current = {
+                "line": idx,
+                "num": -1,
+                "source": "",
+                "title": stripped[4:].strip(),
+                "fields": {},
+                "dup_fields": [],
+                "extra_lines": [],
+                "bad_header": True,
+            }
+            continue
+        if current is None or not stripped:
+            continue
+        if raw.startswith("  ") or raw.startswith("\t"):
+            current["extra_lines"].append((idx, stripped))
+            continue
+        m_field = re.match(r"^-\s+\*\*([^*]+)\*\*[：:]\s*(.*)$", stripped)
+        if m_field:
+            fname = m_field.group(1).strip()
+            fval = m_field.group(2).strip()
+            if fname in current["fields"]:
+                current["dup_fields"].append((idx, fname))
+            current["fields"][fname] = (idx, fval)
+        else:
+            current["extra_lines"].append((idx, stripped))
+
+    if current is not None:
+        cards.append(current)
+    return has_feed_section, cards
+
+
+def _collect_recent_feed_urls(
+    root: Path,
+    days: int = 14,
+    exclude_date: str = "",
+    before_date: datetime.date | None = None,
+) -> list[tuple[str, str, str]]:
+    """Return list of (date_str, title, normalized_url) from daily files in `[anchor - days, before_date)`."""
+    anchor = before_date if before_date is not None else datetime.datetime.now().date()
+    cutoff = anchor - datetime.timedelta(days=days) if days > 0 else datetime.date.min
+    results: list[tuple[str, str, str]] = []
+    for f in _list_daily_files(root):
+        d = _parse_daily_date(f.name)
+        if d is None or d < cutoff:
+            continue
+        if before_date is not None and d >= before_date:
+            continue
+        d_str = d.isoformat()
+        if exclude_date and d_str == exclude_date:
+            continue
+        text = f.read_text(encoding="utf-8", errors="replace")
+        _, body = parse_frontmatter(text)
+        _, cards = _extract_feed_items_from_body(body)
+        for card in cards:
+            link_entry = card["fields"].get("链接") or card["fields"].get("来源链接")
+            if not link_entry:
+                continue
+            _, link_val = link_entry
+            urls = _extract_markdown_urls(link_val) or re.findall(r"https?://[^\s\)\]>]+", link_val)
+            for u in urls:
+                results.append((d_str, card["title"], _normalize_feed_url(u)))
+        # Also collect URLs from `## 顺手清一篇旧藏` so saved items don't immediately re-enter Feed
+        _, saved_lines = _extract_section_lines(body, "顺手清一篇旧藏")
+        for _, raw_s in saved_lines:
+            for u in _extract_markdown_urls(raw_s):
+                m_lbl = re.search(r"\[([^\]]+)\]\(https?://", raw_s)
+                title = m_lbl.group(1) if m_lbl else "旧藏回捞"
+                results.append((d_str, title, _normalize_feed_url(u)))
+    return results
+
+
+def _lint_daily_content(
+    root: Path,
+    text: str,
+    expected_date: str = "",
+    file_label: str = "<stdin>",
+    check_dedup: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Validate daily Markdown against frontend parsing contract and privacy guardrails."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    normalized = text.replace("\r\n", "\n")
+
+    if not normalized.startswith("---\n"):
+        errors.append(f"[{file_label}] 缺少 YAML Frontmatter（必须以 `---` 开头）")
+        return errors, warnings
+
+    close_match = re.search(r"\n---[ \t]*(?:\n|$)", normalized[3:])
+    if not close_match:
+        errors.append(f"[{file_label}] YAML Frontmatter 未闭合")
+        return errors, warnings
+
+    fm_raw = normalized[4 : 3 + close_match.start()]
+    meta, body = parse_frontmatter(normalized)
+
+    # 1. Required frontmatter keys & types
+    required_keys = (
+        "schema_version", "date", "theme", "status",
+        "generated_at", "updated_at", "sources_ok", "sources_skipped", "feed_count",
+    )
+    for k in required_keys:
+        if k == "sources_skipped" and re.search(rf"^{k}[ \t]*:[ \t]*(?:#.*)?$", fm_raw, re.MULTILINE):
+            continue
+        if k == "sources_ok" and meta.get(k, "").strip() == "[]":
+            errors.append(f"[{file_label}] `sources_ok` 不可为空数组（纯离线至少应含 `\"tree\"`）")
+            continue
+        if k not in meta or meta[k] == "":
+            errors.append(f"[{file_label}] Frontmatter 缺少必填字段 `{k}`")
+
+    if meta.get("schema_version", "").strip() != "1":
+        errors.append(f"[{file_label}] `schema_version` 必须为 `1`（当前: `{meta.get('schema_version', '')}`）")
+
+    fm_date = meta.get("date", "").strip()
+    ref_date: datetime.date | None = None
+    if fm_date:
+        try:
+            ref_date = datetime.date.fromisoformat(fm_date)
+        except ValueError:
+            errors.append(f"[{file_label}] `date` 不是合法日期: `{fm_date}`")
+        if expected_date and fm_date != expected_date:
+            errors.append(f"[{file_label}] Frontmatter `date` (`{fm_date}`) 与目标日期 (`{expected_date}`) 不一致")
+    elif expected_date:
+        try:
+            ref_date = datetime.date.fromisoformat(expected_date)
+        except ValueError:
+            ref_date = None
+
+    status = meta.get("status", "").strip().lower()
+    if status and status not in DAILY_ALLOWED_STATUSES:
+        errors.append(f"[{file_label}] `status` 必须为 ready / reviewed（当前: `{status}`）")
+
+    # Validate both inline arrays `[...]` and block lists (`  - item`) for unquoted colons
+    fm_lines = fm_raw.splitlines()
+    for li, raw_line in enumerate(fm_lines):
+        stripped_no_comment = _strip_unquoted_comment(raw_line).strip()
+        m_arr = re.match(r"^(sources_ok|sources_skipped)\s*:\s*\[(.*)\]$", stripped_no_comment)
+        if m_arr:
+            arr_key, inner = m_arr.group(1), m_arr.group(2).strip()
+            for token in _split_yaml_inline_array(inner):
+                is_quoted = (token.startswith('"') and token.endswith('"')) or (token.startswith("'") and token.endswith("'"))
+                if ":" in token and not is_quoted:
+                    errors.append(
+                        f"[{file_label}] Frontmatter `{arr_key}` 含冒号的项 `{token}` 必须加双引号，避免标准 YAML 解析成对象"
+                    )
+        elif re.match(r"^(sources_ok|sources_skipped)\s*:\s*$", stripped_no_comment):
+            arr_key = stripped_no_comment.split(":", 1)[0].strip()
+            j = li + 1
+            while j < len(fm_lines):
+                nxt = fm_lines[j]
+                if not nxt.strip() or nxt.strip().startswith("#"):
+                    j += 1
+                    continue
+                if re.match(r"^\s*-\s+", nxt):
+                    raw_item = _strip_unquoted_comment(re.sub(r"^\s*-\s+", "", nxt)).strip()
+                    is_quoted = (raw_item.startswith('"') and raw_item.endswith('"')) or (raw_item.startswith("'") and raw_item.endswith("'"))
+                    if ":" in raw_item and not is_quoted:
+                        errors.append(
+                            f"[{file_label}] Frontmatter 块级列表 `{arr_key}` 含冒号的项 `{raw_item}` 必须加双引号"
+                        )
+                    j += 1
+                else:
+                    break
+
+    # Validate `feed_count` is a non-negative integer
+    raw_cnt = meta.get("feed_count", "").strip()
+    parsed_feed_count: int | None = None
+    if raw_cnt:
+        if not raw_cnt.isdigit():
+            errors.append(f"[{file_label}] `feed_count` 必须为非负整数（当前: `{raw_cnt}`）")
+        else:
+            parsed_feed_count = int(raw_cnt)
+
+    # 2. Strict Feed card contract (allow omitting/empty section when feed_count == 0 for offline fallback)
+    has_feed_section, cards = _extract_feed_items_from_body(body)
+    if not has_feed_section and parsed_feed_count != 0:
+        errors.append(f"[{file_label}] 缺少必需区块 `## 今日专属 Feed`（纯离线无 Feed 时请设 `feed_count: 0`）")
+    else:
+        if parsed_feed_count is not None and parsed_feed_count != len(cards):
+            errors.append(f"[{file_label}] `feed_count` ({parsed_feed_count}) 与实际 Feed 卡片数 ({len(cards)}) 不一致")
+        allowed_fields = {"结论标签", "关联", "要点", "链接"}
+        recent_urls = {
+            u for _, _, u in _collect_recent_feed_urls(
+                root, days=14, exclude_date=fm_date or expected_date, before_date=ref_date
+            )
+        } if check_dedup else set()
+        seen_today_urls: set[str] = set()
+
+        for card in cards:
+            ln = card["line"]
+            if card.get("bad_header"):
+                errors.append(f"[{file_label}:L{ln}] Feed 标题必须符合 `### N. [来源] 标题` 格式")
+                continue
+            if card["source"] not in DAILY_ALLOWED_SOURCES:
+                errors.append(
+                    f"[{file_label}:L{ln}] Feed 来源 `[{card['source']}]` 不在受控枚举内（允许: {', '.join(sorted(DAILY_ALLOWED_SOURCES))}）"
+                )
+            fields = card["fields"]
+            for dup_ln, dup_name in card.get("dup_fields", []):
+                errors.append(f"[{file_label}:L{dup_ln}] Feed #{card['num']} 出现重复字段 `- **{dup_name}**：`")
+            for req_f in ("结论标签", "关联", "要点", "链接"):
+                if req_f not in fields or not fields[req_f][1]:
+                    errors.append(f"[{file_label}:L{ln}] Feed #{card['num']} 缺少必填字段 `- **{req_f}**：`")
+            for extra_f in set(fields.keys()) - allowed_fields:
+                errors.append(f"[{file_label}:L{ln}] Feed #{card['num']} 含未约定扩展字段 `- **{extra_f}**：`（请并入要点，确保前端稳定解析）")
+            if card["extra_lines"]:
+                bad_ln = card["extra_lines"][0][0]
+                errors.append(f"[{file_label}:L{bad_ln}] Feed #{card['num']} 含多行嵌套/游离文本（每个字段须保持单行，禁止嵌套子列表）")
+            if "结论标签" in fields:
+                tag_val = fields["结论标签"][1]
+                if not re.match(r"^\[(必看原文|看这3句就行|只听片段(?:\s+[^\]]+)?)\]$", tag_val):
+                    errors.append(
+                        f"[{file_label}:L{fields['结论标签'][0]}] `结论标签` 须为 `[必看原文]` / `[看这3句就行]` / `[只听片段 11:25]`（当前: `{tag_val}`）"
+                    )
+            if "要点" in fields and len(fields["要点"][1]) > 240:
+                warnings.append(f"[{file_label}:L{fields['要点'][0]}] Feed #{card['num']} 要点偏长（{len(fields['要点'][1])} 字，建议 ≤180 字）")
+            if "链接" in fields:
+                link_val = fields["链接"][1]
+                urls = _extract_markdown_urls(link_val)
+                if not urls:
+                    errors.append(f"[{file_label}:L{fields['链接'][0]}] Feed #{card['num']} 缺少标准 Markdown 链接 `[名称](https://...)`（拿不到直链应熔断丢弃）")
+                for raw_u in urls:
+                    nu = _normalize_feed_url(raw_u)
+                    if nu in seen_today_urls:
+                        errors.append(f"[{file_label}:L{fields['链接'][0]}] Feed #{card['num']} 链接 `{raw_u}` 在当天日报内重复出现")
+                    seen_today_urls.add(nu)
+                    if nu in recent_urls:
+                        errors.append(f"[{file_label}:L{fields['链接'][0]}] Feed #{card['num']} 链接 `{raw_u}` 在过去 14 天内已推荐过，触发去重拦截")
+
+        # Also prevent `## 顺手清一篇旧藏` from re-recommending a URL already pushed in past 14 days or today's Feed
+        has_saved, saved_lines = _extract_section_lines(body, "顺手清一篇旧藏")
+        saved_items = [s.strip() for _, s in saved_lines if s.strip() and not s.strip().startswith((">", "<!--"))]
+        if has_saved and len(saved_items) > 1:
+            warnings.append(f"[{file_label}] `## 顺手清一篇旧藏` 建议最多保留 1 条（当前 {len(saved_items)} 条）")
+        for s_ln, raw_s in saved_lines:
+            for raw_u in _extract_markdown_urls(raw_s):
+                nu = _normalize_feed_url(raw_u)
+                if nu in seen_today_urls:
+                    errors.append(f"[{file_label}:L{s_ln}] `## 顺手清一篇旧藏` 链接 `{raw_u}` 与当天主 Feed 重复")
+                seen_today_urls.add(nu)
+                if nu in recent_urls:
+                    errors.append(f"[{file_label}:L{s_ln}] `## 顺手清一篇旧藏` 链接 `{raw_u}` 在过去 14 天内已推荐过，触发去重拦截")
+
+    # 3. Validate required core sections (`## 昨日复盘`, `## 候选沉淀`, `## 今日聚焦`)
+    has_review, review_lines = _extract_section_lines(body, "昨日复盘")
+    if not has_review:
+        errors.append(f"[{file_label}] 缺少必需区块 `## 昨日复盘`")
+    else:
+        missing_dims = [
+            dim for dim in ("工作", "学习", "生活")
+            if not any(re.search(rf"^-\s*\*\*{dim}[：:]?\*\*(?:[：:]|\s|$)", ln.strip()) for _, ln in review_lines)
+        ]
+        if missing_dims:
+            warnings.append(
+                f"[{file_label}] `## 昨日复盘` 缺少维度条目：{'、'.join(missing_dims)}（建议按工作/学习/生活三维度梳理）"
+            )
+
+    has_cand, cand_lines = _extract_section_lines(body, "候选沉淀")
+    if not has_cand:
+        errors.append(f"[{file_label}] 缺少必需区块 `## 候选沉淀`（无须入树可写 `- 今日无须入树`）")
+    else:
+        for c_ln, raw_c in cand_lines:
+            sc = raw_c.strip()
+            if not sc or sc.startswith(">") or sc.startswith("<!--"):
+                continue
+            if sc in ("- 今日无须入树", "今日无须入树"):
+                continue
+            if not re.match(r"^-\s+\[[ xX]\]\s+`(create|update|append)`\s+`[^`]+\.md`\s+[—-]+\s+.+$", sc):
+                errors.append(
+                    f"[{file_label}:L{c_ln}] `## 候选沉淀` 条目不符合机器契约：`- [ ] \\`create|update|append\\` \\`路径.md\\` — 结论与理由`"
+                )
+
+    has_focus, _ = _extract_section_lines(body, "今日聚焦")
+    if not has_focus:
+        errors.append(f"[{file_label}] 缺少必需区块 `## 今日聚焦`")
+
+    # 4. Validate fixed H2 headings (forbid dynamic timestamps inside H2 names)
+    for h_ln, raw_h in enumerate(body.replace("\r\n", "\n").splitlines(), 1):
+        sh = raw_h.strip()
+        if sh.startswith("## ") and re.search(r"\d{1,2}:\d{2}", sh):
+            errors.append(f"[{file_label}:L{h_ln}] 二级标题 `{sh}` 不得含动态时间戳（请使用固定 H2 标题名，时间放正文）")
+
+    # 5. Privacy, anti-debug-dump & internal-id guardrails (strip URLs first so X tweet IDs & UUID URLs are never false positives)
+    if re.search(r"^##\s+采集说明\b", body, re.MULTILINE):
+        errors.append(f"[{file_label}] 正文禁止包含 `## 采集说明`（采样明细留在 Frontmatter；源故障仅在文末留单行 `> ⚠️ ...` 提醒）")
+    for leak_phrase in ("不伪造单篇直链", "本次网页搜索仅返回聚合摘要", "仅作试跑"):
+        if leak_phrase in body:
+            errors.append(f"[{file_label}] 正文含系统内部自白「{leak_phrase}」，请删除")
+    body_without_urls = re.sub(r"https?://[^\s\)\]>]+", " ", body)
+    if re.search(r"\b[0-9a-f]{8}-[0-9a-f]{3,4}\b", body_without_urls):
+        errors.append(f"[{file_label}] 正文疑似裸露内部会话哈希 ID，请改为大白话描述")
+    if re.search(r"(?<!\d)\d{15,22}(?!\d)", body_without_urls):
+        errors.append(f"[{file_label}] 正文疑似包含长数字订单号/卡号，请脱敏删除")
+    for pat, _ in tree_seed.SECRET_PATTERNS:
+        if pat.search(text):
+            errors.append(f"[{file_label}] 疑似包含明文密钥/Token，请立即脱敏")
+            break
+
+    return errors, warnings
+
+
+def cmd_daily_init(root: Path, _args: argparse.Namespace) -> None:
+    """Seed default `tree-daily` Skill into user's `04-我如何工作/tree-daily/` if missing."""
+    created = _seed_default_vault_skills(root, only_skill="tree-daily")
+    upgraded = _refresh_mounted_vault_skill_links(root)
+    if created:
+        print(f"✅ 已初始化个人日报 Skill: `{created[0]}/SKILL.md`")
+        if upgraded:
+            print(f"🔗 已自动将 {upgraded} 处已挂载宿主软链升级指向你的个人日报副本")
+        else:
+            print("👉 接下来可运行 `tree install-skill` 将其挂载到本机各 AI 客户端，或在文末直接追加你的个人定制板块。")
+    else:
+        branches = get_branches(root)
+        work_branch = next((b for b in branches if b.startswith("04-")), "04-我如何工作")
+        print(f"ℹ️ `{work_branch}/tree-daily/` 已存在，保留你的个人定制未覆盖。")
+
+
+def cmd_daily_list(root: Path, args: argparse.Namespace) -> None:
+    files = _list_daily_files(root)
+    raw_limit = getattr(args, "limit", 14)
+    limit = len(files) if raw_limit == 0 else max(1, int(raw_limit if raw_limit is not None else 14))
+    log_audit(root, "daily:list", f"limit={raw_limit}")
+    if not files:
+        print("📰 尚无日报记录（目录：`outputs/daily/`，命名格式：`YYYY-MM-DD-<核心主题>.md`）。")
+        return
+    shown = files[:limit]
+    print(f"📰 近期个人日报（共 {len(files)} 份，展示最近 {len(shown)} 份）：\n")
+    for f in shown:
+        meta, _ = parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
+        status = (meta.get("status") or "unknown").strip()
+        theme = (meta.get("theme") or _extract_daily_theme_from_stem(f.stem) or "未标注主题").strip()
+        feed_cnt = (meta.get("feed_count") or "").strip()
+        feed_str = f" · Feed {feed_cnt}条" if feed_cnt else ""
+        print(f"  📄 outputs/daily/{f.name} [{status}{feed_str}] — {theme}")
+
+
+def cmd_daily_path(root: Path, args: argparse.Namespace) -> None:
+    date_str = (getattr(args, "date", "") or "").strip() or datetime.datetime.now().date().isoformat()
+    try:
+        target_date = datetime.date.fromisoformat(date_str)
+    except ValueError:
+        print("❌ 日期无效，请使用合法 YYYY-MM-DD（例如 2026-11-23）", file=sys.stderr)
+        sys.exit(1)
+    norm_date = target_date.isoformat()
+    log_audit(root, "daily:path", norm_date)
+    matches = [f for f in _list_daily_files(root) if _parse_daily_date(f.name) == target_date]
+    if len(matches) == 1:
+        print(str(matches[0].resolve()))
+        return
+    if len(matches) > 1:
+        print(f"❌ 检测到 {norm_date} 存在多个日报文件（违反同日唯一规则）：", file=sys.stderr)
+        for m in matches:
+            print(f"  - {m.resolve()}", file=sys.stderr)
+        sys.exit(1)
+    suggested = _daily_dir(root) / f"{norm_date}-<核心主题>.md"
+    print(f"NOT_FOUND: {suggested}")
+    sys.exit(2)
+
+
+def cmd_daily_latest(root: Path, args: argparse.Namespace) -> None:
+    before_raw = (getattr(args, "before", "") or "").strip()
+    before_date: datetime.date | None = None
+    if before_raw:
+        try:
+            before_date = datetime.date.fromisoformat(before_raw)
+        except ValueError:
+            print("❌ `--before` 日期无效，请使用合法 YYYY-MM-DD", file=sys.stderr)
+            sys.exit(1)
+    files = _list_daily_files(root)
+    if before_date is not None:
+        files = [f for f in files if (_parse_daily_date(f.name) or datetime.date.max) < before_date]
+    if not files:
+        msg = f"📰 在 {before_raw} 之前尚无历史日报。" if before_raw else "📰 尚无历史日报。"
+        print(msg)
+        return
+    latest = files[0]
+    log_audit(root, "daily:latest", f"outputs/daily/{latest.name}", detail=f"before={before_raw}")
+    print(f"# [最新日报: outputs/daily/{latest.name}]\n")
+    print(latest.read_text(encoding="utf-8", errors="replace"))
+
+
+def cmd_daily_recent_feeds(root: Path, args: argparse.Namespace) -> None:
+    raw_days = getattr(args, "days", 14)
+    days = 14 if raw_days is None else max(0, int(raw_days))
+    exclude = (getattr(args, "exclude_date", "") or "").strip()
+    if exclude:
+        try:
+            exclude = datetime.date.fromisoformat(exclude).isoformat()
+        except ValueError:
+            print("❌ `--exclude-date` 日期无效，请使用合法 YYYY-MM-DD", file=sys.stderr)
+            sys.exit(1)
+    log_audit(root, "daily:recent-feeds", f"days={days},exclude={exclude}")
+    items = _collect_recent_feed_urls(root, days=days, exclude_date=exclude)
+    if not items:
+        label = "全部历史" if days == 0 else f"近 {days} 天内"
+        print(f"📡 {label}无已推 Feed 指纹。")
+        return
+    label = "全部历史" if days == 0 else f"近 {days} 天"
+    print(f"📡 {label}已推 Feed 去重指纹（共 {len(items)} 条，请勿重复推荐）：\n")
+    for d_str, title, url in items:
+        print(f"  - [{d_str}] {title} -> {url}")
+
+
+def cmd_daily_lint(root: Path, args: argparse.Namespace) -> None:
+    d_dir = _daily_dir(root)
+    target_date_raw = (getattr(args, "date", "") or "").strip()
+    target_file_raw = (getattr(args, "file", "") or "").strip()
+    all_errors: list[str] = []
+    all_warnings: list[str] = []
+
+    if target_file_raw:
+        p = Path(target_file_raw).expanduser().resolve()
+        if not p.is_file():
+            print(f"❌ 文件不存在: {target_file_raw}", file=sys.stderr)
+            sys.exit(1)
+        d = _parse_daily_date(p.name)
+        errs, warns = _lint_daily_content(root, p.read_text(encoding="utf-8", errors="replace"), d.isoformat() if d else "", p.name)
+        all_errors.extend(errs)
+        all_warnings.extend(warns)
+    else:
+        files = _list_daily_files(root)
+        # Check same-day duplicates
+        by_date: dict[str, list[Path]] = {}
+        for f in files:
+            d = _parse_daily_date(f.name)
+            if d:
+                by_date.setdefault(d.isoformat(), []).append(f)
+        if target_date_raw:
+            try:
+                norm_d = datetime.date.fromisoformat(target_date_raw).isoformat()
+            except ValueError:
+                print("❌ `--date` 日期无效", file=sys.stderr)
+                sys.exit(1)
+            selected = by_date.get(norm_d, [])
+            if not selected:
+                print(f"❌ 未找到 {norm_d} 的日报文件", file=sys.stderr)
+                sys.exit(1)
+            if len(selected) > 1:
+                all_errors.append(f"[同日重复] {norm_d} 存在 {len(selected)} 份日报: {', '.join(x.name for x in selected)}")
+            for f in selected:
+                errs, warns = _lint_daily_content(root, f.read_text(encoding="utf-8", errors="replace"), norm_d, f"outputs/daily/{f.name}")
+                all_errors.extend(errs)
+                all_warnings.extend(warns)
+        else:
+            if not files:
+                print("🩺 Daily 契约体检：尚无日报文件。")
+                return
+            for d_str, group in sorted(by_date.items(), reverse=True):
+                if len(group) > 1:
+                    all_errors.append(f"[同日重复] {d_str} 存在 {len(group)} 份日报: {', '.join(x.name for x in group)}")
+                for f in group:
+                    errs, warns = _lint_daily_content(root, f.read_text(encoding="utf-8", errors="replace"), d_str, f"outputs/daily/{f.name}")
+                    all_errors.extend(errs)
+                    all_warnings.extend(warns)
+
+    log_audit(root, "daily:lint", target_date_raw or target_file_raw or "all", detail=f"err={len(all_errors)},warn={len(all_warnings)}")
+    print("🩺 Daily 日报契约体检报告：")
+    if not all_errors and not all_warnings:
+        print("  ✅ 0 error / 0 warning — 前端解析契约与安全边界全部通过。")
+        return
+    for e in all_errors:
+        print(f"  ❌ {e}")
+    for w in all_warnings:
+        print(f"  ⚠️ {w}")
+    print(f"\n总计：{len(all_errors)} error(s), {len(all_warnings)} warning(s)")
+    if all_errors:
+        sys.exit(1)
+
+
+def cmd_daily_write(root: Path, args: argparse.Namespace) -> None:
+    """Isolated write channel for `outputs/daily/YYYY-MM-DD-<theme>.md` (no README gate, no git commit, atomic same-day uniqueness)."""
+    date_raw = (getattr(args, "date", "") or "").strip() or datetime.datetime.now().date().isoformat()
+    try:
+        target_date = datetime.date.fromisoformat(date_raw)
+    except ValueError:
+        print("❌ `--date` 日期无效，请使用合法 YYYY-MM-DD", file=sys.stderr)
+        sys.exit(1)
+    norm_date = target_date.isoformat()
+
+    content = sys.stdin.read() if args.stdin else (args.content or "")
+    if not content.strip():
+        print("❌ 日报内容不能为空", file=sys.stderr)
+        sys.exit(1)
+
+    meta, _ = parse_frontmatter(content)
+    arg_theme = (getattr(args, "theme", "") or "").strip()
+    fm_theme = (meta.get("theme") or "").strip()
+    if arg_theme and fm_theme and _sanitize_daily_theme(arg_theme) != _sanitize_daily_theme(fm_theme):
+        print(f"❌ `--theme` (`{arg_theme}`) 与 Frontmatter `theme` (`{fm_theme}`) 不一致，请保持一致。", file=sys.stderr)
+        sys.exit(1)
+    theme_raw = arg_theme or fm_theme
+    if not theme_raw:
+        print("❌ 请通过 `--theme` 或 Frontmatter `theme:` 指定核心主题", file=sys.stderr)
+        sys.exit(1)
+    safe_theme = _sanitize_daily_theme(theme_raw)
+    target_name = f"{norm_date}-{safe_theme}.md"
+
+    if not getattr(args, "force", False):
+        errs, warns = _lint_daily_content(root, content, expected_date=norm_date, file_label=f"outputs/daily/{target_name}")
+        for w in warns:
+            print(f"⚠️ {w}", file=sys.stderr)
+        if errs:
+            print("❌ Daily 写入拦截（未通过前端契约或安全校验，请修正后重试）：", file=sys.stderr)
+            for e in errs:
+                print(f"  - {e}", file=sys.stderr)
+            sys.exit(1)
+
+    d_dir = _daily_dir(root)
+    d_dir.mkdir(parents=True, exist_ok=True)
+    target_path = d_dir / target_name
+    existing_same_day = [f for f in _list_daily_files(root) if _parse_daily_date(f.name) == target_date]
+
+    # Write atomically with PID-scoped temp file then clean up any renamed same-day older file
+    tmp_path = d_dir / f".{target_name}.{os.getpid()}.tmp"
+    tmp_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    tmp_path.replace(target_path)
+
+    removed: list[str] = []
+    for old_f in existing_same_day:
+        if old_f.resolve() != target_path.resolve():
+            old_f.unlink()
+            removed.append(old_f.name)
+
+    _sync_gitignore_entries(root, ("outputs/",))
+    agent = getattr(args, "agent", "") or os.environ.get("TREE_AGENT") or "cli-user"
+    log_audit(root, "daily:write", f"outputs/daily/{target_name}", agent=agent, detail=f"replaced={len(removed)}")
+    action = "更新" if existing_same_day else "创建"
+    print(f"✅ 已{action} `outputs/daily/{target_name}`（与 01~04 慢变量及 Git 历史隔离）")
+    if removed:
+        print(f"🔄 已自动清理同日旧主题文件：{', '.join(removed)}")
+
+
+def cmd_ui(root: Path, args: argparse.Namespace) -> None:
+    port = args.port
+
+    class TreeUIHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            pass
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/api/tree":
+                readme_path = find_readme_path(root)
+                readme_obj = None
+                if readme_path:
+                    readme_obj = {
+                        "path": readme_path.name,
+                        "content": readme_path.read_text(encoding="utf-8"),
+                    }
+                data = {"root": str(root), "readme": readme_obj, "branches": [], "dailies": [], "recent_logs": [], "recent_audits": []}
+                ui_branches = [*get_branches(root), "seed"] if (root / "seed").is_dir() else get_branches(root)
+                for b in ui_branches:
+                    b_dir = root / b
+                    pages = []
+                    if b_dir.exists():
+                        for f in _iter_branch_pages(root, b_dir):
+                            rel = str(f.relative_to(root))
+                            pages.append(
+                                {
+                                    "path": rel,
+                                    "title": f.stem,
+                                    "summary": extract_first_summary(f),
+                                    "content": f.read_text(encoding="utf-8", errors="replace"),
+                                }
+                            )
+                    data["branches"].append({"name": b, "pages": pages})
+                for df in _list_daily_files(root)[:30]:
+                    d_text = df.read_text(encoding="utf-8", errors="replace")
+                    d_meta, _ = parse_frontmatter(d_text)
+                    data["dailies"].append(
+                        {
+                            "path": f"outputs/daily/{df.name}",
+                            "date": d_meta.get("date") or (_parse_daily_date(df.name).isoformat() if _parse_daily_date(df.name) else df.stem),
+                            "theme": d_meta.get("theme") or _extract_daily_theme_from_stem(df.stem) or df.stem,
+                            "content": d_text,
+                        }
+                    )
+                log_res = git_run(root, ["log", "-n", "15", "--pretty=format:%h|%ad|%s", "--date=short"])
+                if log_res.stdout:
+                    for line in log_res.stdout.splitlines():
+                        parts = line.split("|", 2)
+                        if len(parts) == 3:
+                            data["recent_logs"].append({"hash": parts[0], "date": parts[1], "msg": parts[2]})
+                audit_file = root / ".tree" / "audit.jsonl"
+                if audit_file.exists():
+                    for line in audit_file.read_text(encoding="utf-8").splitlines()[-15:][::-1]:
+                        try:
+                            data["recent_audits"].append(json.loads(line))
+                        except Exception:
+                            pass
+                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            # Render lightweight single-page dashboard
+            html_page = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Tree — Personal Context OS</title>
+<style>
+  :root { --bg: #0f1115; --panel: #161920; --border: #262a34; --text: #e6e8ee; --muted: #8b92a5; --accent: #34d399; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
+  .sidebar { width: 320px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  .brand { padding: 20px; border-bottom: 1px solid var(--border); }
+  .brand h1 { font-size: 18px; display: flex; align-items: center; gap: 8px; color: var(--accent); }
+  .brand p { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .nav { flex: 1; overflow-y: auto; padding: 12px; }
+  .branch { margin-bottom: 14px; }
+  .branch-title { font-size: 12px; font-weight: 600; color: var(--muted); padding: 6px 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .page-item { padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; margin-top: 2px; transition: background 0.15s; }
+  .page-item:hover, .page-item.active { background: #222733; color: var(--accent); }
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .topbar { padding: 14px 28px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--muted); }
+  .content-area { flex: 1; display: flex; overflow: hidden; }
+  .reader { flex: 1; padding: 32px 48px; overflow-y: auto; line-height: 1.75; }
+  .reader pre { white-space: pre-wrap; font-family: inherit; font-size: 15px; }
+  .inspector { width: 340px; border-left: 1px solid var(--border); background: var(--panel); padding: 20px; overflow-y: auto; font-size: 12px; }
+  .inspector h3 { font-size: 13px; color: var(--accent); margin-bottom: 10px; }
+  .log-item { padding: 8px 0; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .log-item strong { color: var(--text); display: block; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+  <div class="sidebar">
+    <div class="brand">
+      <h1>🌱 Tree Context OS</h1>
+      <p>Local-First · Git-Backed · Agent-Ready</p>
+    </div>
+    <div class="nav" id="nav"></div>
+  </div>
+  <div class="main">
+    <div class="topbar">
+      <span id="current-path">选择左侧专页浏览你的个人上下文</span>
+      <span id="repo-root"></span>
+    </div>
+    <div class="content-area">
+      <div class="reader"><pre id="md-view">加载中...</pre></div>
+      <div class="inspector">
+        <h3>📜 认知演进历史 (Git Commits)</h3>
+        <div id="logs"></div>
+        <h3 style="margin-top:24px;">🛡️ Agent 访问与读写审计</h3>
+        <div id="audits"></div>
+      </div>
+    </div>
+  </div>
+<script>
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+fetch('/api/tree').then(r => r.json()).then(data => {
+  document.getElementById('repo-root').textContent = data.root;
+  const nav = document.getElementById('nav');
+  let firstItemEl = null;
+  let fallbackItemEl = null;
+  if (data.readme) {
+    const rDiv = document.createElement('div');
+    rDiv.className = 'branch';
+    rDiv.innerHTML = `<div class="branch-title">维护准则</div>`;
+    const rItem = document.createElement('div');
+    rItem.className = 'page-item';
+    rItem.textContent = '📜 ' + data.readme.path;
+    rItem.onclick = () => {
+      document.querySelectorAll('.page-item').forEach(el => el.classList.remove('active'));
+      rItem.classList.add('active');
+      document.getElementById('current-path').textContent = data.readme.path;
+      document.getElementById('md-view').textContent = data.readme.content;
+    };
+    if (!fallbackItemEl) fallbackItemEl = rItem;
+    rDiv.appendChild(rItem);
+    nav.appendChild(rDiv);
+  }
+  data.branches.forEach(b => {
+    const div = document.createElement('div');
+    div.className = 'branch';
+    div.innerHTML = `<div class="branch-title">${esc(b.name)} (${b.pages.length})</div>`;
+    b.pages.forEach(p => {
+      const item = document.createElement('div');
+      item.className = 'page-item';
+      item.textContent = '📄 ' + p.path.replace(b.name + '/', '');
+      item.onclick = () => {
+        document.querySelectorAll('.page-item').forEach(el => el.classList.remove('active'));
+        item.classList.add('active');
+        document.getElementById('current-path').textContent = p.path;
+        document.getElementById('md-view').textContent = p.content;
+      };
+      if (!firstItemEl) firstItemEl = item;
+      div.appendChild(item);
+    });
+    nav.appendChild(div);
+  });
+  if (data.dailies && data.dailies.length) {
+    const dDiv = document.createElement('div');
+    dDiv.className = 'branch';
+    dDiv.innerHTML = `<div class="branch-title">📅 每日个人日报 (${data.dailies.length})</div>`;
+    data.dailies.forEach(d => {
+      const item = document.createElement('div');
+      item.className = 'page-item';
+      item.textContent = '📰 ' + d.date + ' · ' + d.theme;
+      item.onclick = () => {
+        document.querySelectorAll('.page-item').forEach(el => el.classList.remove('active'));
+        item.classList.add('active');
+        document.getElementById('current-path').textContent = d.path;
+        document.getElementById('md-view').textContent = d.content;
+      };
+      if (!firstItemEl) firstItemEl = item;
+      dDiv.appendChild(item);
+    });
+    nav.appendChild(dDiv);
+  }
+  const initialEl = firstItemEl || fallbackItemEl;
+  if (initialEl) {
+    initialEl.click();
+  } else {
+    document.getElementById('md-view').textContent = '当前知识库尚无专页，请先完成破土初始化。';
+  }
+  document.getElementById('logs').innerHTML = data.recent_logs.map(l =>
+    `<div class="log-item"><strong>${esc(l.msg)}</strong><span>${esc(l.hash)} · ${esc(l.date)}</span></div>`
+  ).join('');
+  document.getElementById('audits').innerHTML = data.recent_audits.map(a =>
+    `<div class="log-item"><strong>[${esc(a.agent)}] ${esc(a.action)}</strong><span>${esc(a.target)} · ${esc(a.timestamp)}</span></div>`
+  ).join('');
+});
+</script>
+</body>
+</html>"""
+            body = html_page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+
+    print(f"🌱 Tree 本地轻量审阅台已启动: http://127.0.0.1:{port}")
+    server = http.server.HTTPServer(("127.0.0.1", port), TreeUIHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止 Tree UI。")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Tree — 个人上下文操作系统 CLI")
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("init", help="初始化 Tree 四维默认骨架、根契约 README.md 与 Git 仓库")
+    p_inst = sub.add_parser("install-skill", help="一键挂载 tree CLI、Skill 与全局指令受控块到本机已存在的 Agent 目录（最小足迹原则）")
+    p_inst.add_argument("--bin-dir", default="", help="CLI 软链目录（默认 ~/.local/bin）")
+    p_inst.add_argument("--target", default="", help="额外指定的 skills 目录路径")
+    p_inst.add_argument("--dry-run", action="store_true", help="仅预览将挂载哪些目录，不实际写入")
+    p_inst.add_argument("--force", action="store_true", help="强制覆盖已存在的非软链目标")
+    p_inst.add_argument("--no-global-rules", action="store_true", help="仅挂载 Skill 软链，不同步全局指令文件（CLAUDE.md / AGENTS.md / GEMINI.md）受控块")
+
+    p_sglob = sub.add_parser("sync-global", help="同步或移除各宿主全局指令文件（CLAUDE.md / AGENTS.md / GEMINI.md 等）中的 L0 常驻受控块")
+    p_sglob.add_argument("--dry-run", action="store_true", help="仅预览将同步哪些全局指令文件，不实际写入")
+    p_sglob.add_argument("--remove", action="store_true", help="从所有全局指令文件中干净移除 Tree 受控块（保留用户原有内容）")
+    p_ctx = sub.add_parser("context", help="生成供 AI Agent 注入的 L0 全景个人上下文包（支持情境自动对焦与话题透镜）")
+    p_ctx.add_argument("--cwd", default="", help="指定当前工作目录以触发空间与场景自动对焦（默认取调用时的当前目录）")
+    p_ctx.add_argument("-q", "--query", default="", help="可选：传入当前任务或话题关键词，跨 01~04 自动对焦并内联最相关专页")
+    p_ctx.add_argument("--no-auto-focus", action="store_true", help="关闭基于当前工作目录与场景的情境自动对焦")
+
+    p_seed = sub.add_parser("seed", help="统一上下文采集层：只读探测/索引本地 AI 记忆、历史对话、Chrome 与按需外部连接器")
+    seed_sub = p_seed.add_subparsers(dest="seed_cmd")
+    seed_sub.add_parser("scan", help="只读扫描本机可用的记忆文件、本地 AI 聊天、Chrome 与已安装连接器")
+    p_seed_ext = seed_sub.add_parser("extract", help="经授权后生成记忆全量索引，并清洗、脱敏对话/数据库线索至 seed/staging/")
+    p_seed_ext.add_argument("--sources", default="", help="逗号分隔来源: claude,codex,antigravity,cursor,trae,workbuddy,douchat,hermes,openclaw,eden,deepseek,chrome 或已安装连接器（如 getnote,flomo,weread,jike,meituan；默认全部已就绪来源）")
+    p_seed_ext.add_argument("--days", type=int, default=60, help="仅提取最近 N 天的记录（默认 60 天，0 表示不限）")
+    p_seed_ext.add_argument("--max-sessions", type=int, default=30, help="每个来源最多提取的活跃会话或条目数（默认 30）")
+    p_seed_ext.add_argument("--memories-only", action="store_true", help="仅生成旧记忆与规则全量索引（及数据库记忆解包），不提取对话")
+    p_seed_ext.add_argument("--chats-only", action="store_true", help="仅提取对话与外部线索，不生成旧记忆索引")
+    p_seed_read = seed_sub.add_parser("read", help="只读查看单份本地记忆/规则文件（自动脱敏并剥离 Tree 自身同步块）")
+    p_seed_read.add_argument("path", help="目标记忆文件路径（来自 memories-index.md 或第三方记忆系统路径）")
+    p_seed_read.add_argument("--max-chars", type=int, default=12000, help="最多输出字符数（默认 12000，0 表示全文）")
+    p_seed_login = seed_sub.add_parser("login", help="扫码或交互登录需要授权的已安装连接器（如 getnote / flomo / weread / jike / meituan）")
+    p_seed_login.add_argument("source", help="来源标识（如 getnote / flomo / weread / jike / meituan / jd / keep / wechat）")
+    p_seed_login.add_argument("--timeout", type=int, default=180, help="扫码或登录等待超时秒数（默认 180）")
+    p_seed_login.add_argument("--api-key", dest="api_key", default="", help="可选（getnote / flomo / weread 专用）：直接传入 API Key 或 Token 保存，跳过浏览器 OAuth/交互输入")
+    p_seed_login.add_argument("--client-id", dest="client_id", default="", help="可选（getnote 专用）：配合 --api-key 传入 Client ID")
+    p_seed_add = seed_sub.add_parser("add", help="从官方 GitHub water 仓库按需下载外部 App 连接器至 seed/connectors/")
+    p_seed_add.add_argument("sources", nargs="?", default="", help="要安装的连接器 ID（逗号分隔，如 meituan,jd,wechat；留空或加 --list 查看列表）")
+    p_seed_add.add_argument("--list", dest="list_only", action="store_true", help="查看官方 water 仓库支持的全部按需连接器与依赖")
+    p_seed_add.add_argument("--from", dest="from_source", default="", help="可选：自定义远端 raw URL 前缀或本地 water 仓库目录")
+    p_seed_add.add_argument("--force", action="store_true", help="强制覆盖更新已安装的同名连接器")
+    p_seed_rm = seed_sub.add_parser("remove", help="卸载已安装至 seed/connectors/ 的外部连接器")
+    p_seed_rm.add_argument("sources", help="要卸载的连接器 ID（逗号分隔，如 meituan,jd）")
+    p_seed_imp = seed_sub.add_parser("import", help="导入 ChatGPT/Claude Web/豆包/WorkBuddy 导出包或本地笔记目录")
+    p_seed_imp.add_argument("path", help="导出文件（.zip/.json/.jsonl/.md/.txt）或目录路径")
+    p_seed_imp.add_argument("--label", default="", help="来源标签名（如 chatgpt / doubao / workbuddy）")
+    seed_sub.add_parser("status", help="查看 seed/ 外脑持久页、采集源状态与待蒸馏素材")
+    seed_sub.add_parser("clear", help="蒸馏确认入树后清空 seed/staging/ 临时素材")
+
+    p_chat = sub.add_parser("chat", help="跨 AI 实时接力：按需检索并拉取用户在其他 AI 客户端的详细聊天记录")
+    chat_sub = p_chat.add_subparsers(dest="chat_cmd")
+    p_chat_ls = chat_sub.add_parser("list", help="列出本机各 AI 客户端（Claude/Codex/Antigravity/Cursor/Trae/WorkBuddy/豆包/Hermes/Eden/DeepSeek）的近期会话")
+    p_chat_ls.add_argument("--source", default="", help="筛选来源（逗号分隔，如 cursor,claude,workbuddy）")
+    p_chat_ls.add_argument("--query", default="", help="按关键词筛选标题或首轮内容")
+    p_chat_ls.add_argument("-n", "--limit", type=int, default=15, help="最多显示条数（默认 15）")
+    p_chat_rd = chat_sub.add_parser("read", help="拉取指定跨 AI 会话的详细双边问答上下文（自动去噪脱敏）")
+    p_chat_rd.add_argument("ref", help="会话标识 `<source>:<id前缀>`（由 tree chat list 获取）")
+    p_chat_rd.add_argument("--turns", type=int, default=24, help="最多输出最近 N 轮消息（默认 24，0 表示全部）")
+    p_chat_rd.add_argument("--raw-code", action="store_true", help="保留完整大段代码块不折叠")
+
+    p_list = sub.add_parser("list", help="浏览知识树目录结构")
+    p_list.add_argument("subpath", nargs="?", default="", help="可选子目录路径")
+
+    p_read = sub.add_parser("read", help="读取指定上下文页面")
+    p_read.add_argument("path", help="页面相对路径")
+    p_read.add_argument("--agent", default="", help="调用方 Agent 标识")
+
+    p_rules = sub.add_parser("rules", help="读取精简版写入与维护契约（写入前必读；加 --full 看全文）")
+    p_rules.add_argument("--agent", default="", help="调用方 Agent 标识")
+    p_rules.add_argument("--full", action="store_true", help="输出完整的根目录 README.md 原文")
+
+    p_write = sub.add_parser("write", help="创建或更新上下文页面并自动 Git Commit")
+    p_write.add_argument("path", help="页面相对路径")
+    p_write.add_argument("content", nargs="?", default="", help="Markdown 正文内容")
+    p_write.add_argument("--stdin", action="store_true", help="从标准输入读取正文")
+    p_write.add_argument("--reason", default="", help="本次认知更新原因")
+    p_write.add_argument("--agent", default="", help="调用方 Agent 标识")
+    p_write.add_argument("--status", choices=["active", "paused", "archived", "superseded"], default="", help="页面生命周期状态")
+    p_write.add_argument("--kind", choices=["idea", "project"], default="", help="03 专页类型：idea（轻想法）或 project（长期投入项目/副业/自媒体）")
+    p_write.add_argument("--location", default="", help="项目或资产关联的外部路径/仓库/链接（支持逗号分隔多路径，处于该目录时自动对焦）")
+    p_write.add_argument("--when", default="", help="01~04 通用情境触发条件（如特征文件 `*.py, pyproject.toml`、场景词或触发关键词）")
+    p_write.add_argument("--always", action="store_true", help="标记为常驻 L0（always: true），每次冷启动自动加载正文")
+    p_write.add_argument("--no-always", action="store_true", help="标记为按需加载（always: false），仅在 L0 目录露出一行索引")
+    p_write.add_argument("--append", action="store_true", help="在已有页面正文末尾安全追加内容，避免全量覆写长文时丢失旧内容")
+    p_write.add_argument("--force", action="store_true", help="跳过防截断缩水检查（原文>=200字符且新内容缩水超50%%时触发），强制整页覆写")
+    p_write.add_argument("--human-approved", action="store_true", help="经用户明确授权后修改受保护的人类笔记")
+
+    p_del = sub.add_parser("delete", help="删除过期或已合并的页面")
+    p_del.add_argument("path", help="页面相对路径")
+    p_del.add_argument("--reason", default="", help="删除原因")
+    p_del.add_argument("--agent", default="", help="调用方 Agent 标识")
+    p_del.add_argument("--human-approved", action="store_true", help="经用户明确授权后删除受保护的人类笔记")
+
+    p_mv = sub.add_parser("move", help="重命名或跨目录移动页面（自动保留 Git 重命名历史并同步 [[双链]]）")
+    p_mv.add_argument("src", help="原页面相对路径")
+    p_mv.add_argument("dst", help="新页面相对路径")
+    p_mv.add_argument("--reason", default="", help="移动或重命名原因")
+    p_mv.add_argument("--agent", default="", help="调用方 Agent 标识")
+    p_mv.add_argument("--force", action="store_true", help="若目标路径已存在则覆盖")
+    p_mv.add_argument("--human-approved", action="store_true", help="经用户明确授权后移动受保护的人类笔记")
+
+    p_recent = sub.add_parser("recent", help="按近期更新与读写热度自动筛选最近的所思、所想、所做")
+    p_recent.add_argument("--days", type=int, default=None, help="筛选最近 N 天内更新或被读写的活跃页面（默认取 config l0_recent_days=14；0 表示全部未休眠页）")
+
+    p_daily = sub.add_parser("daily", help="管理 outputs/daily/ 每日个人日报与专属 Feed（与 01~04 慢变量和 Git 隔离）")
+    daily_sub = p_daily.add_subparsers(dest="daily_cmd")
+    daily_sub.add_parser("init", help="从出厂模板初始化个人日报 Skill 至 04-我如何工作/tree-daily/")
+    p_daily_ls = daily_sub.add_parser("list", help="列出近期个人日报")
+    p_daily_ls.add_argument("-n", "--limit", type=int, default=14, help="最多显示条数（默认 14，0 表示全部）")
+    p_daily_path = daily_sub.add_parser("path", help="按日期前缀定位当天唯一日报路径（0=命中 / 2=不存在 / 1=冲突）")
+    p_daily_path.add_argument("--date", default="", help="目标日期 YYYY-MM-DD（默认今天）")
+    p_daily_latest = daily_sub.add_parser("latest", help="读取最近一份日报全文（支持 --before 跳过今天读昨日接力）")
+    p_daily_latest.add_argument("--before", default="", help="只读取早于该日期（YYYY-MM-DD）的最新日报")
+    p_daily_rf = daily_sub.add_parser("recent-feeds", help="提取近 N 天已推 Feed URL 指纹，用于跨天防重")
+    p_daily_rf.add_argument("--days", type=int, default=14, help="回溯天数（默认 14）")
+    p_daily_rf.add_argument("--exclude-date", default="", help="排除指定日期（如重写当天时排除今天）")
+    p_daily_lint = daily_sub.add_parser("lint", help="校验日报前端解析契约、同日唯一性与隐私脱敏边界")
+    p_daily_lint.add_argument("--date", default="", help="仅校验指定日期（YYYY-MM-DD）")
+    p_daily_lint.add_argument("--file", default="", help="仅校验指定文件路径")
+    p_daily_wr = daily_sub.add_parser("write", help="通过隔离通道写入或更新日报（自动校验前端契约与同日唯一，不触碰 Git）")
+    p_daily_wr.add_argument("--date", default="", help="目标日期 YYYY-MM-DD（默认今天；凌晨写前一天晚报须显式传昨日）")
+    p_daily_wr.add_argument("--theme", default="", help="核心主题（4~12字，留空则自动读 Frontmatter theme）")
+    p_daily_wr.add_argument("--stdin", action="store_true", help="从标准输入读取完整日报 Markdown")
+    p_daily_wr.add_argument("--agent", default="", help="调用方 Agent 标识")
+    p_daily_wr.add_argument("--force", action="store_true", help="跳过契约校验强制写入（慎用）")
+    p_daily_wr.add_argument("content", nargs="?", default="", help="完整日报 Markdown 正文")
+
+    p_search = sub.add_parser("search", help="全文与结构化元数据组合搜索个人上下文")
+    p_search.add_argument("query", nargs="?", default="", help="可选搜索关键词（可省略，仅按元数据筛选）")
+    p_search.add_argument("--kind", default="", help="按 kind 元数据筛选（如 idea / project）")
+    p_search.add_argument("--status", default="", help="按 status 筛选（active / paused / archived / superseded）")
+    p_search.add_argument("--tag", default="", help="按标签筛选（匹配 frontmatter tags 或正文 #标签）")
+    p_search.add_argument("--always", choices=["true", "false"], default="", help="按是否常驻 L0（always）筛选")
+    p_search.add_argument("--owner", default="", help="按 owner 元数据筛选（如 human）")
+    p_search.add_argument("--branch", default="", help="按一级主干前缀筛选（如 02 / 03）")
+
+    sub.add_parser("lint", help="知识树健康度自检（空目录、碎片命名、记账腔、敏感密钥、同名冲突）")
+
+    p_diff = sub.add_parser("diff", help="查看最近一次或指定提交的认知变更差异")
+    p_diff.add_argument("ref", nargs="?", default="", help="可选 Git Commit 哈希或范围（默认查看工作区改动或最新一次提交）")
+
+    p_revert = sub.add_parser("revert", help="安全回滚指定的一次认知变更提交")
+    p_revert.add_argument("commit", help="要回滚的 Git Commit 哈希（可由 tree log 查看）")
+    p_revert.add_argument("--agent", default="", help="调用方 Agent 标识")
+
+    p_log = sub.add_parser("log", help="查看认知演进 Git 历史与 Agent 审计日志")
+    p_log.add_argument("-n", "--limit", type=int, default=10, help="显示条数")
+    p_log.add_argument("--audit", action="store_true", default=True, help="同时显示审计日志")
+
+    p_ui = sub.add_parser("ui", help="启动本地浏览器轻量审阅看板")
+    p_ui.add_argument("--port", type=int, default=7788, help="本地端口号")
+    p_ui.add_argument("--no-open", action="store_true", help="仅启动本地服务，不自动打开浏览器")
+
+    p_remote = sub.add_parser("remote", help="查看或绑定 GitHub/GitLab 私有云端仓库（可选）")
+    p_remote.add_argument("url", nargs="?", default="", help="远端 Git 仓库 URL（建议使用 Private 仓库）")
+    p_remote.add_argument("--name", default="origin", help="远端名称（默认 origin）")
+    p_remote.add_argument("--remove", action="store_true", help="移除指定远端仓库")
+
+    p_sync = sub.add_parser("sync", help="与云端 Git 仓库双向同步（拉取 rebase + 推送）")
+    p_sync.add_argument("--remote", default="origin", help="远端名称（默认 origin）")
+    p_sync.add_argument("--branch", default="", help="同步分支（默认当前分支）")
+    p_sync.add_argument("--dry-run", action="store_true", help="仅预览同步动作，不实际推送")
+    sync_sub = p_sync.add_subparsers(dest="sync_cmd")
+    p_sync_sched = sync_sub.add_parser("schedule", help="管理每日定时自动远程同步（macOS launchd / Linux crontab）")
+    p_sync_sched.add_argument("--enable", action="store_true", help="开启每日定时自动同步")
+    p_sync_sched.add_argument("--disable", action="store_true", help="关闭每日定时自动同步")
+    p_sync_sched.add_argument("--status", action="store_true", help="查看当前定时同步状态")
+    p_sync_sched.add_argument("--time", default="23:00", help="每日同步时间 HH:MM（默认 23:00）")
+
+    args = parser.parse_args()
+    root = get_tree_root()
+
+    if args.cmd == "init":
+        cmd_init(root, args)
+    elif args.cmd == "install-skill":
+        cmd_install_skill(root, args)
+    elif args.cmd == "sync-global":
+        cmd_sync_global(root, args)
+    elif args.cmd == "context":
+        cmd_context(root, args)
+    elif args.cmd == "seed":
+        if args.seed_cmd == "scan":
+            tree_seed.cmd_seed_scan(root, args, log_audit)
+        elif args.seed_cmd == "extract":
+            tree_seed.cmd_seed_extract(root, args, log_audit)
+        elif args.seed_cmd == "read":
+            tree_seed.cmd_seed_read(root, args, log_audit)
+        elif args.seed_cmd == "login":
+            tree_seed.cmd_seed_login(root, args, log_audit)
+        elif args.seed_cmd == "add":
+            tree_seed.cmd_seed_add(root, args, log_audit)
+        elif args.seed_cmd == "remove":
+            tree_seed.cmd_seed_remove(root, args, log_audit)
+        elif args.seed_cmd == "import":
+            tree_seed.cmd_seed_import(root, args, log_audit)
+        elif args.seed_cmd == "status":
+            tree_seed.cmd_seed_status(root, args, log_audit)
+        elif args.seed_cmd == "clear":
+            tree_seed.cmd_seed_clear(root, args, log_audit)
+        else:
+            p_seed.print_help()
+    elif args.cmd == "chat":
+        if args.chat_cmd == "list":
+            tree_seed.cmd_chat_list(root, args, log_audit)
+        elif args.chat_cmd == "read":
+            tree_seed.cmd_chat_read(root, args, log_audit)
+        else:
+            p_chat.print_help()
+    elif args.cmd == "list":
+        cmd_list(root, args)
+    elif args.cmd == "read":
+        cmd_read(root, args)
+    elif args.cmd == "rules":
+        cmd_rules(root, args)
+    elif args.cmd == "write":
+        cmd_write(root, args)
+    elif args.cmd == "delete":
+        cmd_delete(root, args)
+    elif args.cmd == "move":
+        cmd_move(root, args)
+    elif args.cmd == "recent":
+        cmd_recent(root, args)
+    elif args.cmd == "daily":
+        if args.daily_cmd == "init":
+            cmd_daily_init(root, args)
+        elif args.daily_cmd == "list":
+            cmd_daily_list(root, args)
+        elif args.daily_cmd == "path":
+            cmd_daily_path(root, args)
+        elif args.daily_cmd == "latest":
+            cmd_daily_latest(root, args)
+        elif args.daily_cmd == "recent-feeds":
+            cmd_daily_recent_feeds(root, args)
+        elif args.daily_cmd == "lint":
+            cmd_daily_lint(root, args)
+        elif args.daily_cmd == "write":
+            cmd_daily_write(root, args)
+        else:
+            p_daily.print_help()
+    elif args.cmd == "search":
+        cmd_search(root, args)
+    elif args.cmd == "lint":
+        cmd_lint(root, args)
+    elif args.cmd == "diff":
+        cmd_diff(root, args)
+    elif args.cmd == "revert":
+        cmd_revert(root, args)
+    elif args.cmd == "log":
+        cmd_log(root, args)
+    elif args.cmd == "ui":
+        cmd_ui(root, args)
+    elif args.cmd == "remote":
+        cmd_remote(root, args)
+    elif args.cmd == "sync":
+        if args.sync_cmd == "schedule":
+            cmd_sync_schedule(root, args)
+        else:
+            cmd_sync(root, args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        main()
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
