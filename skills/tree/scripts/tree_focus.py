@@ -114,6 +114,8 @@ class PageNode:
     when_rules: tuple[str, ...]
     tags: frozenset[str]
     wikilinks: tuple[str, ...]
+    origin: str = "self"
+    source: str = ""
 
 
 @dataclasses.dataclass
@@ -155,7 +157,10 @@ def _normalize_path_str(raw: str) -> str:
 def _split_multi_values(raw: str) -> tuple[str, ...]:
     if not raw:
         return ()
-    parts = [p.strip() for p in re.split(r"[,，;；\n]+", raw) if p.strip()]
+    s = raw.strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    parts = [p.strip().strip("'\"") for p in re.split(r"[,，;；\n]+", s) if p.strip().strip("'\"")]
     return tuple(parts)
 
 
@@ -167,9 +172,11 @@ def _extract_tags(meta: dict[str, str], body: str) -> frozenset[str]:
             cleaned = t.strip(" []'\"#").lower()
             if cleaned and cleaned != "focus":
                 tags.add(cleaned)
-    for m in INLINE_TAG_RE.finditer(body):
+    cleaned_body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    cleaned_body = re.sub(r"`[^`\n]+`", "", cleaned_body)
+    for m in INLINE_TAG_RE.finditer(cleaned_body):
         tok = m.group(1).strip().lower()
-        if tok and tok not in {"focus", "note"}:
+        if tok and tok != "focus":
             tags.add(tok)
     return frozenset(tags)
 
@@ -226,6 +233,31 @@ def _tokenize_query(query: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
+def _parse_git_config_remote_url(cfg_text: str) -> str:
+    """Extract remote URL from `.git/config`, preferring `[remote "origin"]` and ignoring `[submodule ...]`."""
+    section = ""
+    origin_url = ""
+    first_remote_url = ""
+    for raw_line in cfg_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        m = re.match(r"^url\s*=\s*(.+)$", line)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        sec_low = section.lower()
+        if sec_low == 'remote "origin"':
+            origin_url = val
+            break
+        if sec_low.startswith('remote "') and not first_remote_url:
+            first_remote_url = val
+    return origin_url or first_remote_url
+
+
 def _detect_git_info(cwd: Path) -> tuple[Path | None, str]:
     """Fast git root & remote URL detection without spawning subprocesses when possible."""
     curr = cwd
@@ -245,25 +277,37 @@ def _detect_git_info(cwd: Path) -> tuple[Path | None, str]:
     if config_path and config_path.is_file():
         try:
             cfg_text = config_path.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"^\s*url\s*=\s*(.+)$", cfg_text, re.MULTILINE)
-            if m:
-                return git_root, m.group(1).strip()
+            url = _parse_git_config_remote_url(cfg_text)
+            if url:
+                return git_root, url
         except Exception:
             pass
 
-    try:
-        res = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=str(git_root),
-            capture_output=True,
-            text=True,
-            timeout=0.5,
-        )
-        if res.returncode == 0:
-            return git_root, (res.stdout or "").strip()
-    except Exception:
-        pass
+    for git_args in (["git", "remote", "get-url", "origin"], ["git", "config", "--get-regexp", r"^remote\..*\.url$"]):
+        try:
+            res = subprocess.run(
+                git_args,
+                cwd=str(git_root),
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+            )
+            if res.returncode == 0 and (res.stdout or "").strip():
+                out_line = res.stdout.strip().splitlines()[0].strip()
+                if git_args[1] == "config" and " " in out_line:
+                    return git_root, out_line.split(" ", 1)[1].strip()
+                return git_root, out_line
+        except Exception:
+            pass
     return git_root, ""
+
+
+def _is_tree_tool_repo_parent(tree_resolved: Path) -> bool:
+    """Return True only when `tree_resolved` is `<Tree-tool-repo>/vault`, never an arbitrary `~/vault`."""
+    if tree_resolved.name != "vault":
+        return False
+    parent = tree_resolved.parent
+    return (parent / "bin" / "tree").exists() or (parent / "skills" / "tree" / "SKILL.md").is_file()
 
 
 def probe_workspace(
@@ -274,8 +318,8 @@ def probe_workspace(
     """Inspect caller's working directory and query to build a deterministic WorkspaceSignal."""
     cwd = (caller_cwd or Path.cwd()).expanduser().resolve()
     tree_resolved = tree_root.resolve()
-    # Also recognize the parent tool repository when tree_root is `<repo>/vault`
-    tool_repo_root = tree_resolved.parent if tree_resolved.name == "vault" else tree_resolved
+    # Only recognize the parent tool repository when tree_root is genuinely `<Tree-tool-repo>/vault`
+    tool_repo_root = tree_resolved.parent if _is_tree_tool_repo_parent(tree_resolved) else tree_resolved
     is_inside_tree = (
         cwd == tree_resolved
         or str(cwd).startswith(str(tree_resolved) + os.sep)
@@ -404,17 +448,21 @@ def _path_matches_target(cwd: Path, git_root: Path | None, target_raw: str) -> b
 
 
 def _body_mentions_workspace(body: str, cwd: Path, git_root: Path | None) -> str:
-    """Check if page body explicitly mentions the current workspace path (with strict path-boundary check)."""
+    """Check if page body explicitly mentions the current workspace path (never matching parent directories)."""
     candidates = [cwd]
     if git_root and git_root != cwd:
         candidates.append(git_root)
     home_str = str(Path.home().resolve())
-    # A valid path mention in Markdown must end at EOF, path separator `/`, whitespace, backtick, quote, or punctuation
-    boundary_tail = r"(?=$|[/\s`'\"，。；、,;)\]>])"
+    # Must NOT accept `/` as trailing boundary, otherwise `~/Work/app` falsely matches parent dir `~/Work`
+    boundary_tail = r"(?=$|[\s`'\"，。；、,;)\]>])"
     for p in candidates:
         p_str = str(p)
-        if len(p_str) > 4 and re.search(rf"{re.escape(p_str)}{boundary_tail}", body):
-            return p_str
+        variants = [p_str]
+        if p_str.startswith("/private/tmp/") or p_str == "/private/tmp" or p_str.startswith("/private/var/"):
+            variants.append(p_str[len("/private"):])
+        for v in variants:
+            if len(v) > 4 and re.search(rf"{re.escape(v)}{boundary_tail}", body):
+                return v
         if p_str.startswith(home_str):
             tilde_str = "~" + p_str[len(home_str) :]
             if len(tilde_str) > 3 and re.search(rf"{re.escape(tilde_str)}{boundary_tail}", body):
@@ -467,6 +515,7 @@ def _resolve_wikilink_node(
         matches = [node for rel, node in nodes_by_rel.items() if rel.endswith(suffix_md)]
         if len(matches) == 1:
             return matches[0]
+        return None
     if source_rel and "/" in source_rel:
         parent_prefix = source_rel.rsplit("/", 1)[0] + "/"
         stem_name = Path(cleaned).stem
@@ -492,12 +541,27 @@ def build_focus_bundle(
     nodes: list[PageNode],
     signal: WorkspaceSignal,
     max_hits: int = 6,
+    branch_roles: dict[str, set[str]] | None = None,
 ) -> FocusBundle:
     """
     Execute the 3-Layer Situational Auto-Focus & Cross-Branch Resonance pipeline.
     Only non-always, non-dormant pages are candidates for situational promotion
     (always-on pages are already in L0 Section 1, though their links/paths participate).
     """
+    roles = branch_roles or {}
+    active_set = set(roles.get("active") or ())
+    norms_set = set(roles.get("norms") or ())
+    identity_set = set(roles.get("identity") or ())
+
+    def _is_active(branch_name: str) -> bool:
+        return (branch_name in active_set) if active_set else branch_name.startswith("03-")
+
+    def _is_norms(branch_name: str) -> bool:
+        return (branch_name in norms_set) if norms_set else branch_name.startswith("04-")
+
+    def _is_identity(branch_name: str) -> bool:
+        return (branch_name in identity_set) if identity_set else branch_name.startswith("01-")
+
     hits_by_rel: dict[str, FocusedHit] = {}
     anchor_nodes: list[PageNode] = []
     matched_known_location = False
@@ -556,14 +620,14 @@ def build_focus_bundle(
         # 2B. Body mentions current workspace path (e.g. `01-关于我/设备与资产.md`)
         mentioned_path = _body_mentions_workspace(node.body, signal.cwd, signal.git_root)
         if mentioned_path and not any(_path_matches_target(signal.cwd, signal.git_root, l) for l in node.locations):
-            if node.branch.startswith("03-") and node not in anchor_nodes:
+            if _is_active(node.branch) and node not in anchor_nodes:
                 anchor_nodes.append(node)
             _record_hit(
                 node,
                 65.0,
                 "anchor",
                 f"正文登记了当前工作目录 `{mentioned_path}`",
-                inline=node.branch.startswith("03-"),
+                inline=_is_active(node.branch),
             )
 
         # 2C. Explicit frontmatter `when:` trigger rules
@@ -575,28 +639,29 @@ def build_focus_bundle(
                     70.0,
                     "scene",
                     f"命中触发规则 ({', '.join(when_matches[:2])})",
-                    inline=node.branch.startswith("04-"),
+                    inline=_is_norms(node.branch),
                 )
 
-        # 2D. Scene -> `> 适用时机：` / summary / tags matching (especially powerful for 04 & 01)
-        # When an explicit project location is already locked, only auto-trigger 04 (working norms)
-        # and 01 (environment assets) by scene so sibling projects in 03 aren't pulled in as noise.
-        # Pages in `seed/` (external brain registry & curated collections) only trigger on explicit
-        # query (-q), when rules, location, or [[wikilink]] resonance, never on generic file-extension scenes.
-        if signal.detected_scenes and not node.is_always and node.branch != "seed":
-            if not (matched_known_location and node.branch.startswith("03-")):
+        # 2D. Scene -> `> 适用时机：` / summary / tags matching (especially powerful for norms & identity)
+        if (
+            signal.detected_scenes
+            and not node.is_always
+            and node.branch != "seed"
+            and node.origin != "external"
+        ):
+            if not (matched_known_location and _is_active(node.branch)):
                 haystack = f"{node.stem} {node.trigger_hint} {' '.join(node.tags)}".lower()
                 for scene_id in signal.detected_scenes:
                     scene_label, _markers, _exts, kw_list = SCENE_TAXONOMY[scene_id]
                     matched_kws = [kw for kw in kw_list if _keyword_in_text(kw, haystack)]
-                    min_kws = 1 if node.branch.startswith(("04-", "01-")) else 2
+                    min_kws = 1 if (_is_norms(node.branch) or _is_identity(node.branch)) else 2
                     if len(matched_kws) >= min_kws:
                         _record_hit(
                             node,
                             35.0 + min(len(matched_kws) * 5.0, 20.0),
                             "scene",
                             f"现场特征 [{scene_label}] 匹配适用时机 ({' / '.join(matched_kws[:3])})",
-                            inline=node.branch.startswith("04-"),
+                            inline=_is_norms(node.branch),
                         )
 
         # 2E. Query / Intent Lens (`tree context --query "..."`) across 01~04
@@ -653,6 +718,16 @@ def build_focus_bundle(
     # 1) Outgoing [[wikilinks]]
     # 2) Incoming [[wikilinks]]
     # 3) Shared #tags or shared domain concept tokens in title/trigger
+    # Pre-compute header/summary document frequency across active nodes so ubiquitous
+    # vault-wide terms (e.g. the vault's own product name) don't trigger noisy resonance.
+    concept_df: dict[str, int] = {}
+    for n in nodes:
+        n_tokens = set(_tokenize_query(f"{_node_display_name(n)} {n.trigger_hint} {n.summary}"))
+        for tok in n_tokens:
+            if len(tok) >= 3:
+                concept_df[tok] = concept_df.get(tok, 0) + 1
+    df_cap = max(2, int(len(nodes) * 0.10))
+
     for anchor in list(anchor_nodes):
         anchor_label = _node_display_name(anchor)
         # 3A. Outgoing [[wikilinks]] from anchor
@@ -694,17 +769,23 @@ def build_focus_bundle(
                     )
 
             # Cross-branch domain concept resonance (e.g. 03 `Tree产品定位` <-> 02 `个人上下文系统核心判断`)
-            # Never auto-resonate from one 03 project into a different 03 project unless explicitly wikilinked.
+            # Never auto-resonate from one 03 project into a different 03 project, or pull `origin: external`
+            # / legacy `seed/` pages into workspace focus without explicit [[wikilink]] / #tag / query.
             if (
                 peer.branch != anchor.branch
-                and not (anchor.branch.startswith("03-") and peer.branch.startswith("03-"))
+                and peer.branch != "seed"
+                and peer.origin != "external"
+                and not (_is_active(anchor.branch) and _is_active(peer.branch))
                 and anchor_concepts
             ):
                 peer_header = f"{peer.stem} {peer.trigger_hint} {peer.summary}".lower()
                 generic_terms = {"项目", "产品", "系统", "工作", "决策", "规范", "定位", "架构", "设计", "核心", "判断", "web", "ai", "skill"}
                 shared_concepts = [
                     c for c in anchor_concepts
-                    if len(c) >= 3 and c not in generic_terms and _keyword_in_text(c, peer_header)
+                    if len(c) >= 3
+                    and c not in generic_terms
+                    and concept_df.get(c, 0) <= df_cap
+                    and _keyword_in_text(c, peer_header)
                 ]
                 if shared_concepts:
                     _record_hit(
@@ -729,7 +810,7 @@ def build_focus_bundle(
         or signal.cwd == home_dir / "Desktop"
         or signal.cwd == home_dir / "Downloads"
         or cwd_str in {"/", "/tmp", "/private/tmp", "/var/tmp"}
-        or cwd_str.startswith(("/tmp/", "/private/tmp/", "/var/folders/"))
+        or cwd_str.startswith(("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"))
     )
     if (
         not matched_known_location
@@ -740,10 +821,11 @@ def build_focus_bundle(
         target_dir = signal.git_root or signal.cwd
         scene_names = [SCENE_TAXONOMY[s][0] for s in signal.detected_scenes]
         scene_str = f"（识别为 {' / '.join(scene_names)}）" if scene_names else ""
+        active_branch_label = sorted(active_set)[0] if active_set else "03-我正在做的事"
         untracked_hint = (
-            f"当前工作目录 `{target_dir}`{scene_str} 尚未在 `03-我正在做的事/` 中绑定 `location`。"
+            f"当前工作目录 `{target_dir}`{scene_str} 尚未在 `{active_branch_label}/` 中绑定 `location`。"
             f"若本次对话产生该项目的长期定位或关键决策，可在达成共识后通过 "
-            f"`tree write \"03-我正在做的事/工作/<项目名>/项目总览.md\" --kind project --location \"{target_dir}\"` 纳入追踪。"
+            f"`tree write \"{active_branch_label}/工作/<项目名>/项目总览.md\" --kind project --location \"{target_dir}\"` 纳入追踪。"
         )
 
     return FocusBundle(
@@ -788,8 +870,13 @@ def format_focus_section(
                 "resonance": "🔗跨维共振",
             }.get(hit.match_kind, "🎯自动对焦")
             reason_str = "；".join(hit.reasons[:2])
+            origin_badge = ""
+            if node.origin == "external":
+                origin_badge = f" `[外部参考{': ' + node.source[:36] if node.source else ''}]`"
+            elif node.origin == "mixed":
+                origin_badge = " `[含外部参考]`"
             out.append(
-                f"- **{kind_badge} [{branch_short}]** `{node.rel_path}` [{node.updated_iso}] — {node.summary}"
+                f"- **{kind_badge} [{branch_short}]** `{node.rel_path}` [{node.updated_iso}]{origin_badge} — {node.summary}"
             )
             out.append(f"  - *触发依据*: {reason_str}")
 
@@ -833,6 +920,7 @@ class GlobalInstructionTarget:
     label: str
     host_dir: Path
     file_path: Path
+    agent_slug: str = ""
 
 
 def get_global_instruction_targets(home: Path | None = None) -> list[GlobalInstructionTarget]:
@@ -843,16 +931,16 @@ def get_global_instruction_targets(home: Path | None = None) -> list[GlobalInstr
     """
     h = (home or Path.home()).expanduser().resolve()
     targets: list[GlobalInstructionTarget] = [
-        GlobalInstructionTarget("Claude Code", h / ".claude", h / ".claude" / "CLAUDE.md"),
-        GlobalInstructionTarget("Codex", h / ".codex", h / ".codex" / "AGENTS.md"),
-        GlobalInstructionTarget("Gemini / Antigravity", h / ".gemini", h / ".gemini" / "GEMINI.md"),
-        GlobalInstructionTarget("Hermes Agent", h / ".hermes", h / ".hermes" / "SOUL.md"),
-        GlobalInstructionTarget("OpenCode", h / ".config" / "opencode", h / ".config" / "opencode" / "AGENTS.md"),
-        GlobalInstructionTarget("Windsurf", h / ".codeium" / "windsurf", h / ".codeium" / "windsurf" / "memories" / "global_rules.md"),
-        GlobalInstructionTarget("Universal Agents", h / ".agents", h / ".agents" / "AGENTS.md"),
-        GlobalInstructionTarget("WorkBuddy", h / ".workbuddy", h / ".workbuddy" / "MEMORY.md"),
-        GlobalInstructionTarget("WorkBuddy (USER.md)", h / ".workbuddy", h / ".workbuddy" / "USER.md"),
-        GlobalInstructionTarget("OpenClaw", h / ".openclaw", h / ".openclaw" / "AGENTS.md"),
+        GlobalInstructionTarget("Claude Code", h / ".claude", h / ".claude" / "CLAUDE.md", "claude-code"),
+        GlobalInstructionTarget("Codex", h / ".codex", h / ".codex" / "AGENTS.md", "codex"),
+        GlobalInstructionTarget("Gemini / Antigravity", h / ".gemini", h / ".gemini" / "GEMINI.md", "antigravity"),
+        GlobalInstructionTarget("Hermes Agent", h / ".hermes", h / ".hermes" / "SOUL.md", "hermes"),
+        GlobalInstructionTarget("OpenCode", h / ".config" / "opencode", h / ".config" / "opencode" / "AGENTS.md", "opencode"),
+        GlobalInstructionTarget("Windsurf", h / ".codeium" / "windsurf", h / ".codeium" / "windsurf" / "memories" / "global_rules.md", "windsurf"),
+        GlobalInstructionTarget("Universal Agents", h / ".agents", h / ".agents" / "AGENTS.md", ""),
+        GlobalInstructionTarget("WorkBuddy", h / ".workbuddy", h / ".workbuddy" / "MEMORY.md", "workbuddy"),
+        GlobalInstructionTarget("WorkBuddy (USER.md)", h / ".workbuddy", h / ".workbuddy" / "USER.md", "workbuddy"),
+        GlobalInstructionTarget("OpenClaw", h / ".openclaw", h / ".openclaw" / "AGENTS.md", "openclaw"),
     ]
 
     # Dynamic discovery for 豆包工作 (Douchat) account-scoped shared/MEMORY.md
@@ -873,6 +961,7 @@ def get_global_instruction_targets(home: Path | None = None) -> list[GlobalInstr
                     f"豆包工作 (Douchat{suffix})",
                     s_dir,
                     s_dir / "MEMORY.md",
+                    "douchat",
                 )
             )
         break
@@ -883,7 +972,8 @@ def get_global_instruction_targets(home: Path | None = None) -> list[GlobalInstr
 def render_global_instruction_block(
     tree_root: Path,
     always_pages: list[tuple[str, str, str]],
-    max_lines_per_page: int = 24,
+    max_lines_per_page: int = 45,
+    agent_slug: str = "",
 ) -> str:
     """
     Build the self-contained `<!-- TREE-CONTEXT:START --> ... <!-- TREE-CONTEXT:END -->` block.
@@ -891,15 +981,19 @@ def render_global_instruction_block(
     """
     default_vault = Path(__file__).resolve().parent.parent.parent.parent / "vault"
     is_custom_vault = tree_root.resolve() != default_vault.resolve()
-    env_prefix = f'TREE_HOME="{tree_root}" ' if is_custom_vault else ""
+    env_parts: list[str] = []
+    if is_custom_vault:
+        env_parts.append(f'TREE_HOME="{tree_root}"')
+    if agent_slug:
+        env_parts.append(f"TREE_AGENT={agent_slug}")
+    env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
     lines: list[str] = [
         BLOCK_START_MARKER,
-        "## 🌱 Tree 个人上下文系统（L0 常驻底线与情境唤醒契约）",
-        f"> **Tree 是用户自有的个人上下文系统**（本地 Markdown + Git 仓库：`{tree_root}`），按 `01-关于我 / 02-我的思考 / 03-我正在做的事 / 04-我如何工作` 维护一棵人机共读的个人知识树，只沉淀模型原本不知道的个人真实信息与判断，供所有 AI 工具共享消费、也由用户直接阅读和演化。请勿手动编辑本受控块，内容变更统一走 `tree write`：",
-        "> - **第 0 秒底线**：下述 `always: true` 核心画像与全局协作底线在所有对话中默认生效，无需调用工具即可直接遵守。",
-        f"> - **第 1 秒情境点亮**：当对话涉及具体项目、代码仓库、方案写作、部署运维或历史决策时，**首轮立即执行** `{env_prefix}tree context -q \"<当前任务或话题关键词>\"`（若 `tree` 未在 PATH 中则调用 `{env_prefix}~/.local/bin/tree`），系统会自动根据当前工作目录（`cwd`）与话题跨 `01~04` 点亮专属上下文包。",
-        f"> - **上下文演进与写回（更新到 Tree，不散落在宿主私有区）**：Tree 不是单一客户端的附属记忆，而是用户跨所有 AI 共用的个人上下文底座——写进 Tree 的内容会按结构落到对应专页、保留 Git 历史、可供用户直接审阅，并自动同步给本机其他 AI 客户端；若只写进当前宿主的私有区域（如 `USER.md` / `MEMORY.md` / 内置 memory 工具），信息会退化成被锁死在单一工具里的黑盒碎片。每当对话中出现新的个人事实、重要思考判断、项目拍板、对 AI 的明确纠偏，或外部上下文源增减（统一由 AI 替用户在 `seed/外部上下文源.md` 动态维护）时，**先执行 `{env_prefix}~/.local/bin/tree rules`（或 `tree read README.md`），再用 `{env_prefix}~/.local/bin/tree write` 原地更新到对应专页**，不要只记在宿主私有记忆里。",
-        f"> - **无 Shell / 沙盒异常降级通道**：仅当宿主无 Shell 工具或 Shell 环境异常（如沙盒返回 `Exit Code: 127`）无法运行 `tree` CLI 时，允许降级使用宿主内置的文件工具直接先读 `{tree_root}/README.md` 再原地编辑 `{tree_root}/01~04` 下的对应 `.md` 专页（`tree` 下次运行时会自动检测未提交变更并完成 Git 提交与全端同步）。",
+        "## 🌱 Tree 个人上下文系统（本地目录：`{tree_root}`）".format(tree_root=tree_root),
+        "> **跨 AI 共享的个人上下文底座**（只记关于用户的真实信息与判断，请勿手改本受控块）：",
+        "> - **第 0 秒底线**：以下 `always: true` 核心画像默认生效，无需重复加载。",
+        f"> - **第 1 秒对焦**：涉及具体项目、方案写作、部署或历史决策时，首轮运行 `{env_prefix}tree context --no-always -q \"<关键词>\"`（或 `{env_prefix}~/.local/bin/tree ...`）按需点亮上下文。",
+        f"> - **写回 Tree（不散落在宿主私有记忆）**：对话中出现新的个人事实、判断、生活细节、项目进展或对 AI 的纠偏时，先运行 `{env_prefix}~/.local/bin/tree rules` 对齐规则，再用 `{env_prefix}~/.local/bin/tree write` 维护（无 Shell 或沙盒异常时，可降级先读 `{tree_root}/README.md` 再直接编辑 `{tree_root}` 下对应 `.md`）。",
         "",
     ]
 
@@ -942,7 +1036,20 @@ def upsert_managed_block_in_text(existing_text: str, block_text: str) -> str:
                 return block_clean
             return ""
 
-        return MANAGED_BLOCK_RE.sub(_repl, normalized)
+        result = MANAGED_BLOCK_RE.sub(_repl, normalized)
+        # Also strip any trailing/dangling orphan markers outside the valid managed block
+        parts = MANAGED_BLOCK_RE.split(result)
+        blocks = MANAGED_BLOCK_RE.findall(result)
+        if blocks and any(BLOCK_START_MARKER in p or BLOCK_END_MARKER in p for p in parts):
+            cleaned_parts = [
+                "\n".join(ln for ln in p.splitlines() if ln.strip() not in {BLOCK_START_MARKER, BLOCK_END_MARKER})
+                for p in parts
+            ]
+            rebuilt = cleaned_parts[0]
+            for b, tail in zip(blocks, cleaned_parts[1:]):
+                rebuilt += b + tail
+            return rebuilt
+        return result
 
     # Clean up any corrupted orphan markers (e.g., END before START, or unclosed START) so user lines remain safe
     if BLOCK_START_MARKER in normalized or BLOCK_END_MARKER in normalized:
@@ -1048,13 +1155,14 @@ def ensure_workbuddy_sandbox_allow_write(
         allow_list = []
         sbx["extraAllowWrite"] = allow_list
 
-    # Format tree_root as `~/...` if inside home, plus parent repo root if tree_root is `<repo>/vault`
-    tree_abs = str(tree_root.resolve())
+    # Format tree_root as `~/...` if inside home, plus parent repo root ONLY when tree_root is `<Tree-tool-repo>/vault`
+    tree_resolved = tree_root.resolve()
+    tree_abs = str(tree_resolved)
     home_str = str(h)
     tree_entry = ("~" + tree_abs[len(home_str) :]) if tree_abs.startswith(home_str + os.sep) else tree_abs
     entries_to_allow = [tree_entry]
-    if tree_root.resolve().name == "vault":
-        parent_abs = str(tree_root.resolve().parent)
+    if _is_tree_tool_repo_parent(tree_resolved):
+        parent_abs = str(tree_resolved.parent)
         parent_entry = ("~" + parent_abs[len(home_str) :]) if parent_abs.startswith(home_str + os.sep) else parent_abs
         entries_to_allow.append(parent_entry)
     entries_to_allow.append("~/.local/bin")
@@ -1089,7 +1197,6 @@ def sync_global_instructions(
       `"created" | "updated" | "unchanged" | "removed" | "skipped"`.
     """
     targets = get_global_instruction_targets(home=home)
-    block_text = render_global_instruction_block(tree_root, always_pages) if not remove else ""
     results: list[tuple[str, Path, str]] = []
 
     for tgt in targets:
@@ -1098,10 +1205,12 @@ def sync_global_instructions(
         fp = tgt.file_path
         existed = fp.is_file()
         old_text = fp.read_text(encoding="utf-8", errors="ignore") if existed else ""
-        has_block = BLOCK_START_MARKER in old_text and BLOCK_END_MARKER in old_text
+        managed_match = MANAGED_BLOCK_RE.search(old_text.replace("\r\n", "\n"))
+        has_block = bool(managed_match)
+        has_any_marker = BLOCK_START_MARKER in old_text or BLOCK_END_MARKER in old_text
 
         if remove:
-            if not existed or not has_block:
+            if not existed or not has_any_marker:
                 continue
             new_text, removed = remove_managed_block_from_text(old_text)
             if removed:
@@ -1111,13 +1220,15 @@ def sync_global_instructions(
             continue
 
         if only_existing_blocks:
-            if not has_block:
+            if not has_block or not managed_match:
                 continue
-            # Guard against temporary/sandboxed TREE_HOME tests overwriting the host's mounted production vault block
-            expected_root_tag = f"本地 Markdown + Git 仓库：`{tree_root}`"
-            if "本地 Markdown + Git 仓库：`" in old_text and expected_root_tag not in old_text:
+            # Inspect ONLY inside the managed block so user notes outside it can never hijack vault matching
+            block_inner = managed_match.group(0)
+            m_root = re.search(r"(?:本地目录|本地 Markdown \+ Git 仓库)[：:]\s*`([^`]+)`", block_inner)
+            if m_root and m_root.group(1).strip() != str(tree_root):
                 continue
 
+        block_text = render_global_instruction_block(tree_root, always_pages, agent_slug=tgt.agent_slug)
         new_text = upsert_managed_block_in_text(old_text, block_text)
         if existed and new_text == old_text.replace("\r\n", "\n"):
             results.append((tgt.label, fp, "unchanged"))

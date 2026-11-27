@@ -5,9 +5,9 @@ Zero external dependencies (Python standard library only).
 
 Design principles:
 1. Read-only access to local agent data stores (never modifies source apps).
-2. Unified under `seed/` — persistent external brain registry & curated collections (`seed/*.md`) are tracked by Git, while runtime cache (`seed/staging/`, `seed/connectors/`, `seed/sources.json`) is gitignored so raw chats never pollute the Git tree.
+2. Runtime cache (`.tree/staging/`, `.tree/sources.json`) is gitignored so raw chats never pollute Git.
 3. Strips code dumps, tool logs, system wrappers, and redacts secrets before staging.
-4. Supports incremental cursors (`seed/sources.json`) and official export imports (ChatGPT/Claude/Doubao/WorkBuddy/Markdown).
+4. Supports incremental cursors (`.tree/sources.json`) and official export imports (ChatGPT/Claude/Doubao/WorkBuddy/Markdown).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import importlib
-import importlib.util
+import io
 import json
 import os
 import re
@@ -25,31 +25,28 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-DEFAULT_WATER_REPO = "https://raw.githubusercontent.com/shangxiuyu/water/main"
-KNOWN_WATER_CONNECTORS = ("getnote", "flomo", "weread", "jike", "meituan", "taobao", "dingdong", "jd", "xianyu", "keep", "wechat")
-SOURCE_ALIASES = {"dedao": "getnote", "biji": "getnote", "wxread": "weread", "fumo": "flomo"}
-
 
 # Secret redaction patterns (best-effort safety net before staging)
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"-----BEGIN [A-Z0-9 ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]+ PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
-    (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"), "[REDACTED_API_KEY]"),
-    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED_GITHUB_TOKEN]"),
-    (re.compile(r"\bAIza[0-9A-Za-z_\-]{25,}\b"), "[REDACTED_GOOGLE_KEY]"),
-    (re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b"), "[REDACTED_SLACK_TOKEN]"),
-    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"), "[REDACTED_JWT]"),
-    (re.compile(r"\b(?:LTAI|AKID)[A-Za-z0-9]{12,}\b"), "[REDACTED_CLOUD_AK]"),
+    (re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])sk-[A-Za-z0-9_\-]{16,}(?![A-Za-z0-9_\-])"), "[REDACTED_API_KEY]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}(?![A-Za-z0-9_\-])"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])github_pat_[A-Za-z0-9_]{22,}(?![A-Za-z0-9_\-])"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])AIza[0-9A-Za-z_\-]{25,}(?![A-Za-z0-9_\-])"), "[REDACTED_GOOGLE_KEY]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])xox[baprs]-[0-9A-Za-z\-]{10,}(?![A-Za-z0-9_\-])"), "[REDACTED_SLACK_TOKEN]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}(?![A-Za-z0-9_\-])"), "[REDACTED_JWT]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])(?:LTAI|AKID)[A-Za-z0-9]{12,}(?![A-Za-z0-9_\-])"), "[REDACTED_CLOUD_AK]"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9_\-])"), "[REDACTED_CLOUD_AK]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9_\-\.]{20,}"), r"\1[REDACTED_TOKEN]"),
-    (re.compile(r"(?i)((?:cookie|set-cookie|sessionid|sid)\s*[:=]\s*['\"]?)[^\s'\"\n;]{12,}"), r"\1[REDACTED_COOKIE]"),
-    (re.compile(r"(?i)((?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*['\"]?)[^\s'\",;]{10,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)((?:cookie|set-cookie)\s*:\s*)[^\r\n]{12,}"), r"\1[REDACTED_COOKIE]"),
+    (re.compile(r"(?i)((?:cookie|set-cookie|sessionid|sid)\s*=\s*['\"]?)[^\s'\"\n;&]{12,}"), r"\1[REDACTED_COOKIE]"),
+    (re.compile(r"(?i)((?:api[_-]?key|secret|token|password|passwd)\s*[:=]\s*['\"]?)[A-Za-z0-9_\-\./+=:@!#$%^*?~]{10,}"), r"\1[REDACTED]"),
 ]
 
 # System wrapper tags to strip from user/assistant messages
@@ -74,35 +71,14 @@ def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def seed_dir(root: Path) -> Path:
-    d = root / "seed"
-    legacy = root / ".tree" / "seed"
-    if legacy.is_dir():
-        d.mkdir(parents=True, exist_ok=True)
-        for item in list(legacy.iterdir()):
-            dst = d / item.name
-            if not dst.exists():
-                shutil.move(str(item), str(dst))
-        try:
-            shutil.rmtree(legacy)
-        except Exception:
-            pass
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 def staging_dir(root: Path) -> Path:
-    d = seed_dir(root) / "staging"
+    d = root / ".tree" / "staging"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-def user_connectors_dir(root: Path) -> Path:
-    return seed_dir(root) / "connectors"
 
 
 def sources_file(root: Path) -> Path:
-    return seed_dir(root) / "sources.json"
+    return root / ".tree" / "sources.json"
 
 
 def load_sources_state(root: Path) -> dict[str, Any]:
@@ -171,9 +147,56 @@ def redact_pii(text: str) -> str:
     return out
 
 
+def redact_all(text: str) -> str:
+    """Redact both secrets/tokens and PII (Chinese mobile phone numbers & 18-digit resident IDs)."""
+    return redact_pii(redact_secrets(text))
+
+
 def redact_lifestyle_text(text: str) -> str:
     """Redact phone numbers, ID cards, tokens, and keys while keeping preference semantics."""
-    return redact_pii(redact_secrets(text))
+    return redact_all(text)
+
+
+def _ts_to_seconds(raw_ts: Any) -> float:
+    """Normalize valid epoch seconds / ms / us / ns (2010..2100) into seconds, returning 0.0 on malformed values."""
+    try:
+        val = float(raw_ts or 0)
+    except Exception:
+        return 0.0
+    if val <= 0:
+        return 0.0
+    min_sec, max_sec = 1262304000.0, 4102444800.0  # 2010-01-01 .. 2100-01-01
+    for scale in (1.0, 1e3, 1e6, 1e9):
+        candidate = val / scale
+        if min_sec <= candidate <= max_sec:
+            return candidate
+    return 0.0
+
+
+def _safe_fromtimestamp(raw_ts: Any, fmt: str = "%Y-%m-%d", fallback: str = "recent") -> str:
+    """Format a Unix timestamp safely without ever crashing on malformed or out-of-range values."""
+    sec = _ts_to_seconds(raw_ts)
+    if sec <= 0:
+        return fallback
+    try:
+        return datetime.datetime.fromtimestamp(sec).strftime(fmt)
+    except (ValueError, OverflowError, OSError):
+        return fallback
+
+
+def _connect_sqlite_ro(db_path: str | Path, timeout: float = 1.0) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=timeout)
+
+
+def _has_substantive_memory_content(p: Path) -> bool:
+    """Return True if a memory/rules file exists and still has content after stripping Tree's own managed block."""
+    try:
+        if not p.is_file() or p.stat().st_size == 0:
+            return False
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+        return bool(strip_tree_context_block(raw))
+    except Exception:
+        return False
 
 
 def clean_chat_text(text: str, max_len: int = 500) -> str:
@@ -287,7 +310,7 @@ def discover_claude_sources() -> dict[str, Any]:
     home = Path.home()
     base = home / ".claude"
     memories: list[Path] = []
-    if (base / "CLAUDE.md").is_file():
+    if _has_substantive_memory_content(base / "CLAUDE.md"):
         memories.append(base / "CLAUDE.md")
     proj_dir = base / "projects"
     if proj_dir.is_dir():
@@ -309,7 +332,7 @@ def discover_codex_sources() -> dict[str, Any]:
     home = Path.home()
     base = home / ".codex"
     memories: list[Path] = []
-    if (base / "AGENTS.md").is_file() and (base / "AGENTS.md").stat().st_size > 0:
+    if _has_substantive_memory_content(base / "AGENTS.md"):
         memories.append(base / "AGENTS.md")
     mem_dir = base / "memories"
     if mem_dir.is_dir():
@@ -318,7 +341,7 @@ def discover_codex_sources() -> dict[str, Any]:
     db_memory_count = 0
     if mem_db.is_file():
         try:
-            conn = sqlite3.connect(f"file:{mem_db}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(mem_db)
             row = conn.execute("SELECT COUNT(*) FROM stage1_outputs").fetchone()
             db_memory_count = int(row[0]) if row else 0
             conn.close()
@@ -344,7 +367,7 @@ def discover_antigravity_sources() -> dict[str, Any]:
     memories: list[Path] = []
     for name in ("GEMINI.md", "MEMORY.md"):
         p = gem / name
-        if p.is_file() and p.stat().st_size > 0:
+        if _has_substantive_memory_content(p):
             memories.append(p)
     brain = gem / "antigravity/brain"
     chats = (
@@ -375,7 +398,7 @@ def discover_cursor_sources() -> dict[str, Any]:
     composer_count = 0
     if db:
         try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db)
             row = conn.execute(
                 "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
             ).fetchone()
@@ -400,7 +423,7 @@ def discover_workbuddy_sources() -> dict[str, Any]:
     memories: list[Path] = []
     for name in ("MEMORY.md", "USER.md", "IDENTITY.md", "SOUL.md"):
         p = base / name
-        if p.is_file() and p.stat().st_size > 0:
+        if _has_substantive_memory_content(p):
             memories.append(p)
     for sub in ("memory", "memery"):
         mdir = base / sub
@@ -448,13 +471,16 @@ def discover_douchat_sources() -> dict[str, Any]:
     latest_date = ""
     if base:
         for name in ("MEMORY.md", "USER.md"):
-            memories.extend(sorted((base / "accounts").glob(f"*/shared/{name}")) if (base / "accounts").is_dir() else [])
+            if (base / "accounts").is_dir():
+                for p in sorted((base / "accounts").glob(f"*/shared/{name}")):
+                    if _has_substantive_memory_content(p):
+                        memories.append(p)
         db = base / "douchat.db"
         if db.is_file() and db.stat().st_size > 0:
             db_path = str(db)
             latest_date = file_mtime_iso(db)
             try:
-                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                conn = _connect_sqlite_ro(db)
                 row = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()
                 conv_count = int(row[0]) if row else 0
                 conn.close()
@@ -466,7 +492,7 @@ def discover_douchat_sources() -> dict[str, Any]:
         "id": "douchat",
         "name": "豆包工作 (Douchat)",
         "available": bool(memories or conv_count > 0),
-        "memory_files": [str(p) for p in memories if p.is_file() and p.stat().st_size > 0],
+        "memory_files": [str(p) for p in memories],
         "db_path": db_path,
         "chat_count": conv_count,
         "latest_date": latest_date,
@@ -508,7 +534,7 @@ def discover_trae_sources() -> dict[str, Any]:
                 if not st.is_file():
                     continue
                 try:
-                    conn = sqlite3.connect(f"file:{st}?mode=ro", uri=True)
+                    conn = _connect_sqlite_ro(st)
                     rows = conn.execute(
                         "SELECT value FROM ItemTable WHERE key LIKE 'memento/icube-ai-%chat-storage-%'"
                     ).fetchall()
@@ -525,15 +551,14 @@ def discover_trae_sources() -> dict[str, Any]:
                             for s in slist:
                                 if isinstance(s, dict) and s.get("messages"):
                                     session_count += 1
-                                    created = int(s.get("updatedAt") or s.get("createdAt") or 0)
-                                    mtime = created / 1000.0 if created > 1_000_000_000_000 else float(created)
-                                    if mtime > latest_mtime:
+                                    mtime = _ts_to_seconds(s.get("updatedAt") or s.get("createdAt") or 0)
+                                    if 946684800 <= mtime <= 4102444800 and mtime > latest_mtime:
                                         latest_mtime = mtime
                 except Exception:
                     pass
 
-    if latest_mtime > 1_000_000_000:
-        latest_date = datetime.datetime.fromtimestamp(latest_mtime).strftime("%Y-%m-%d")
+    if latest_mtime > 0:
+        latest_date = _safe_fromtimestamp(latest_mtime, "%Y-%m-%d", fallback="")
 
     return {
         "id": "trae",
@@ -547,12 +572,16 @@ def discover_trae_sources() -> dict[str, Any]:
 
 
 def get_eden_db_path() -> Path | None:
+    env_db = (os.environ.get("EDEN_DB_PATH") or "").strip()
+    if env_db:
+        p_env = Path(env_db).expanduser()
+        if p_env.is_file() and p_env.stat().st_size > 0:
+            return p_env
     home = Path.home()
     candidates = [
         home / "Library/Application Support/ahub-desktop/ahub.db",
         home / "Library/Application Support/eden/ahub.db",
         home / ".eden/ahub.db",
-        home / "Desktop/Eden-AI-main/ahub.db",
     ]
     valid = [p for p in candidates if p.is_file() and p.stat().st_size > 0]
     if not valid:
@@ -568,7 +597,7 @@ def discover_eden_sources() -> dict[str, Any]:
     if db:
         latest_date = file_mtime_iso(db)
         try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db)
             row = conn.execute(
                 "SELECT COUNT(DISTINCT room_id) FROM messages WHERE sender_id = 'WebUser' AND type = 'chat'"
             ).fetchone()
@@ -624,7 +653,7 @@ def discover_hermes_sources() -> dict[str, Any]:
     memories: list[Path] = []
     for rel in ("SOUL.md", "memories/MEMORY.md", "memories/USER.md"):
         p = base / rel
-        if p.is_file() and p.stat().st_size > 0:
+        if _has_substantive_memory_content(p):
             memories.append(p)
     db = base / "state.db"
     db_path = ""
@@ -634,7 +663,7 @@ def discover_hermes_sources() -> dict[str, Any]:
         db_path = str(db)
         latest_date = file_mtime_iso(db)
         try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db)
             row = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE COALESCE(message_count, 0) > 0"
             ).fetchone()
@@ -661,7 +690,7 @@ def discover_openclaw_sources() -> dict[str, Any]:
     memories: list[Path] = []
     for name in ("AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md", "MEMORY.md"):
         p = base / name
-        if p.is_file() and p.stat().st_size > 0:
+        if _has_substantive_memory_content(p):
             memories.append(p)
     for sub in ("memory", "memories"):
         mdir = base / sub
@@ -685,7 +714,7 @@ def discover_openclaw_sources() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Built-in Zero-Dependency Context Sources: Google Chrome & Jike (即刻)
+# Built-in Zero-Dependency Context Sources: Google Chrome
 # ---------------------------------------------------------------------------
 
 CHROME_EPOCH_OFFSET_US = 11644473600 * 1_000_000
@@ -786,7 +815,11 @@ def discover_chrome_sources() -> dict[str, Any]:
     }
 
 
-def extract_chrome_context(days: int, max_sessions: int) -> tuple[str, int, list[str]]:
+def extract_chrome_context(
+    days: int,
+    max_sessions: int,
+    skip_ids: set[str] | None = None,
+) -> tuple[str, int, list[str]]:
     chrome_dir = _chrome_user_data_dir()
     if not chrome_dir:
         return "", 0, []
@@ -794,14 +827,14 @@ def extract_chrome_context(days: int, max_sessions: int) -> tuple[str, int, list
     if not profiles:
         return "", 0, []
 
+    eff_days = days if days > 0 else 90
     limit = max(5, min(max_sessions, 30))
     lines = [
         "# Google Chrome 书签与高频访问线索（仅用于提炼常用工具、技术栈与关注领域，严禁流水入树）",
-        f"> 提取时间: {now_iso()} | 回溯窗口: 近 {days or 60} 天 | 不读取 Cookie 与密码",
+        f"> 提取时间: {now_iso()} | 回溯窗口: 近 {eff_days} 天 | 不读取 Cookie 与密码",
         "",
     ]
 
-    eff_days = days if days > 0 else 90
     cutoff_us = int((time.time() - eff_days * 86400) * 1_000_000) + CHROME_EPOCH_OFFSET_US
     min_visits = 1 if eff_days <= 7 else 3
     order_by = "last_visit_time DESC" if eff_days <= 7 else "visit_count DESC, last_visit_time DESC"
@@ -821,7 +854,7 @@ def extract_chrome_context(days: int, max_sessions: int) -> tuple[str, int, list
             seen_urls: set[str] = set()
             try:
                 shutil.copy2(hist_path, tmp_db)
-                conn = sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True)
+                conn = _connect_sqlite_ro(tmp_db)
                 cur = conn.execute(
                     f"""
                     SELECT url, title, visit_count,
@@ -900,86 +933,16 @@ def extract_chrome_context(days: int, max_sessions: int) -> tuple[str, int, list
 
     if total_items == 0:
         return "", 0, []
-    return redact_lifestyle_text("\n".join(lines).strip() + "\n"), total_items, [short_hash(f"chrome:{total_items}")]
+    body_text = redact_all("\n".join(lines).strip() + "\n")
+    fp = short_hash(f"chrome:{eff_days}:{total_items}:{body_text[120:600]}")
+    if skip_ids and fp in skip_ids:
+        return "", 0, []
+    return body_text, total_items, [fp]
 
 
-def get_connector_helpers() -> dict[str, Any]:
+def scan_all_local_sources(_root: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Discover all 12 built-in local sources (11 local AI clients + Chrome)."""
     return {
-        "clean_chat_text": clean_chat_text,
-        "redact_secrets": redact_secrets,
-        "redact_lifestyle_text": redact_lifestyle_text,
-        "extract_text_from_content": extract_text_from_content,
-        "now_iso": now_iso,
-        "file_mtime_iso": file_mtime_iso,
-        "within_days": within_days,
-        "short_hash": short_hash,
-    }
-
-
-def _load_connector_module(entry_file: Path, mod_tag: str, extra_sys_dir: Path | None = None) -> Any | None:
-    inserted = False
-    dir_str = str(extra_sys_dir) if extra_sys_dir else ""
-    if dir_str and dir_str not in sys.path:
-        sys.path.insert(0, dir_str)
-        inserted = True
-    try:
-        spec = importlib.util.spec_from_file_location(mod_tag, str(entry_file))
-        if not spec or not spec.loader:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        if inserted and dir_str in sys.path:
-            # Keep package dir at the end so lazy imports inside extract()/login_qr() also resolve
-            sys.path.remove(dir_str)
-            sys.path.append(dir_str)
-
-
-def load_plugin_connectors(root: Path) -> dict[str, Any]:
-    """Dynamically load read-only connectors from `seed/connectors/<name>.py` or `<name>/connector.py`."""
-    plugins: dict[str, Any] = {}
-    search_dirs = [
-        Path(__file__).resolve().parent / "seed_connectors",
-        user_connectors_dir(root),
-    ]
-    for d in search_dirs:
-        if not d.is_dir():
-            continue
-        # 1. Single-file connectors: *.py
-        for py_file in sorted(d.glob("*.py")):
-            if py_file.name.startswith("_"):
-                continue
-            try:
-                mod = _load_connector_module(py_file, f"tree_seed_plugin_{py_file.stem}", d)
-                if not mod:
-                    continue
-                cid = str(getattr(mod, "CONNECTOR_ID", py_file.stem)).strip().lower()
-                if cid and callable(getattr(mod, "discover", None)):
-                    plugins[cid] = mod
-            except Exception as e:
-                print(f"⚠️ 加载自定义连接器 `{py_file.name}` 失败（已跳过）: {e}", file=sys.stderr)
-        # 2. Self-contained package connectors: <name>/connector.py (installed via `tree seed add`)
-        for sub_dir in sorted(p for p in d.iterdir() if p.is_dir() and not p.name.startswith((".", "_"))):
-            entry = sub_dir / "connector.py"
-            if not entry.is_file():
-                entry = sub_dir / "__init__.py"
-            if not entry.is_file():
-                continue
-            try:
-                mod = _load_connector_module(entry, f"tree_seed_pkg_{sub_dir.name}", sub_dir)
-                if not mod:
-                    continue
-                cid = str(getattr(mod, "CONNECTOR_ID", sub_dir.name)).strip().lower()
-                if cid and callable(getattr(mod, "discover", None)):
-                    plugins[cid] = mod
-            except Exception as e:
-                print(f"⚠️ 加载连接器包 `{sub_dir.name}` 失败（已跳过）: {e}", file=sys.stderr)
-    return plugins
-
-
-def scan_all_local_sources(root: Path | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    discovered: dict[str, dict[str, Any]] = {
         "claude": discover_claude_sources(),
         "codex": discover_codex_sources(),
         "antigravity": discover_antigravity_sources(),
@@ -993,18 +956,6 @@ def scan_all_local_sources(root: Path | None = None) -> tuple[dict[str, dict[str
         "deepseek": discover_deepseek_sources(),
         "chrome": discover_chrome_sources(),
     }
-    plugins = load_plugin_connectors(root) if root else {}
-    for cid, mod in plugins.items():
-        try:
-            info = mod.discover()
-            if isinstance(info, dict):
-                info.setdefault("id", cid)
-                info.setdefault("name", getattr(mod, "CONNECTOR_NAME", cid))
-                info["is_plugin"] = True
-                discovered[cid] = info
-        except Exception as e:
-            print(f"⚠️ 自定义连接器 `{cid}` 探测失败（已跳过）: {e}", file=sys.stderr)
-    return discovered, plugins
 
 
 # ---------------------------------------------------------------------------
@@ -1031,7 +982,7 @@ def _summarize_memory_file(p: Path) -> tuple[int, str, bool]:
     for line in body.splitlines():
         s = line.strip().lstrip("#>-* ").strip()
         if s and not s.startswith("<!--"):
-            preview = redact_secrets(s)[:80]
+            preview = redact_all(s)[:80]
             break
     return len(stripped), preview, False
 
@@ -1120,13 +1071,13 @@ def extract_sqlite_memories(
             continue
         sections.append(f"## 来源：{info.get('name', sid)} (`{info['memory_db']}`)")
         try:
-            conn = sqlite3.connect(f"file:{info['memory_db']}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(info["memory_db"])
             rows = conn.execute(
                 "SELECT thread_id, rollout_slug, raw_memory, rollout_summary FROM stage1_outputs ORDER BY source_updated_at DESC LIMIT 30"
             ).fetchall()
             conn.close()
             for tid, slug, raw_mem, summary in rows:
-                txt = redact_secrets((raw_mem or summary or "").strip())
+                txt = redact_all((raw_mem or summary or "").strip())
                 if not txt:
                     continue
                 block = f"### `{slug or tid}`\n{txt[:1500]}\n"
@@ -1165,6 +1116,8 @@ def parse_claude_session(path: Path) -> tuple[str, str, list[str]]:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue
                 t = obj.get("type")
                 if not cwd and isinstance(obj.get("cwd"), str):
                     cwd = obj["cwd"]
@@ -1195,6 +1148,8 @@ def parse_codex_session(path: Path) -> tuple[str, str, list[str]]:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue
                 t = obj.get("type")
                 payload = obj.get("payload")
                 if t == "session_meta" and isinstance(payload, dict):
@@ -1223,6 +1178,8 @@ def parse_antigravity_session(path: Path) -> tuple[str, str, list[str]]:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue
                 if obj.get("type") == "USER_INPUT":
                     raw = extract_text_from_content(obj.get("content"))
                     cleaned = clean_chat_text(raw, max_len=450)
@@ -1246,6 +1203,8 @@ def parse_workbuddy_session(path: Path) -> tuple[str, str, list[str]]:
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    continue
+                if not isinstance(obj, dict):
                     continue
                 t = obj.get("type")
                 if not cwd and isinstance(obj.get("cwd"), str):
@@ -1286,7 +1245,7 @@ def iter_deepseek_session_lines(path: Path) -> list[str]:
                 return mod.decompress(raw_bytes).decode("utf-8", errors="ignore").splitlines()
             if hasattr(mod, "ZstdDecompressor"):
                 dctx = mod.ZstdDecompressor()
-                with dctx.stream_reader(raw_bytes) as reader:
+                with dctx.stream_reader(io.BytesIO(raw_bytes)) as reader:
                     return reader.read().decode("utf-8", errors="ignore").splitlines()
         except Exception:
             pass
@@ -1319,13 +1278,14 @@ def parse_deepseek_session(path: Path) -> tuple[str, str, list[str]]:
                 obj = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(obj, dict):
+                continue
             t = obj.get("type")
             if t == "session":
                 if isinstance(obj.get("cwd"), str):
                     cwd = obj["cwd"]
                 if isinstance(obj.get("createdAt"), (int, float)) and obj["createdAt"] > 1_000_000_000:
-                    sec = obj["createdAt"] / 1000 if obj["createdAt"] > 1_000_000_000_000 else obj["createdAt"]
-                    date_str = datetime.datetime.fromtimestamp(sec).strftime("%Y-%m-%d")
+                    date_str = _safe_fromtimestamp(obj["createdAt"], "%Y-%m-%d", fallback=date_str)
             elif t == "session/title":
                 tdata = obj.get("data")
                 if isinstance(tdata, dict) and isinstance(tdata.get("title"), str):
@@ -1371,20 +1331,22 @@ def extract_douchat_chats(
     days: int,
     max_sessions: int,
     max_chars: int = 35000,
+    skip_ids: set[str] | None = None,
 ) -> tuple[str, int, list[str]]:
     if not db_path_str or not Path(db_path_str).is_file():
         return "", 0, []
+    skip = skip_ids or set()
     lines: list[str] = [
         "# 豆包工作 (Douchat) 本地历史对话精华（人类发言与意图流）",
         f"> 生成时间: {now_iso()} | 范围: 最近 {days} 天，最多 {max_sessions} 场对话 | 只读安全提取。",
         "> **按需下钻双边上下文**：若某场人类发言有价值但缺 AI 回复看不清来龙去脉，用标题中的 `ref` 执行 `tree chat read \"<ref>\" --turns 30` 调阅人+AI完整对话。",
         "",
     ]
-    cutoff_ms = (datetime.datetime.now().timestamp() - days * 86400) * 1000 if days > 0 else 0
-    sessions_out: list[tuple[int, str, str, list[str]]] = []
+    cutoff_sec = (datetime.datetime.now().timestamp() - days * 86400) if days > 0 else 0.0
+    sessions_out: list[tuple[float, str, str, list[str]]] = []
 
     try:
-        conn = sqlite3.connect(f"file:{db_path_str}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_path_str)
         agent_ids = {r[0] for r in conn.execute("SELECT id FROM agents").fetchall() if r and r[0]}
         conv_rows = conn.execute(
             "SELECT id, updatedAt, data FROM conversations ORDER BY updatedAt DESC LIMIT ?",
@@ -1396,7 +1358,11 @@ def extract_douchat_chats(
                 ts_val = int(updated_at or 0)
             except Exception:
                 ts_val = 0
-            if cutoff_ms and ts_val > 1_000_000_000_000 and ts_val < cutoff_ms:
+            ts_sec = _ts_to_seconds(ts_val)
+            fp = short_hash(f"douchat:{cid}:{ts_val}")
+            if fp in skip or str(cid) in skip:
+                continue
+            if cutoff_sec and ts_sec > 946684800 and ts_sec < cutoff_sec:
                 continue
             cname = cid
             owner_id = ""
@@ -1416,6 +1382,8 @@ def extract_douchat_chats(
                     mobj = json.loads(mdata_str or "{}")
                 except Exception:
                     continue
+                if not isinstance(mobj, dict):
+                    continue
                 aid = str(mobj.get("authorId") or "")
                 aname = str(mobj.get("authorName") or "").lower()
                 if aid in agent_ids:
@@ -1427,23 +1395,20 @@ def extract_douchat_chats(
                 if txt and len(txt) >= 2:
                     user_msgs.append(txt)
             if user_msgs:
-                sessions_out.append((ts_val, cid, cname, user_msgs))
+                sessions_out.append((ts_sec, cid, cname, user_msgs))
         conn.close()
     except Exception as e:
         lines.append(f"> *(读取 Douchat 数据库时跳过: {e})*")
         return "\n".join(lines), 0, []
 
+    sessions_out.sort(key=lambda x: x[0], reverse=True)
     total_chars = 0
     used = 0
     processed_ids: list[str] = []
-    for ts_val, cid, cname, user_msgs in sessions_out[:max_sessions]:
-        date_str = (
-            datetime.datetime.fromtimestamp(ts_val / 1000).strftime("%Y-%m-%d")
-            if ts_val > 1_000_000_000_000
-            else (datetime.datetime.fromtimestamp(ts_val).strftime("%Y-%m-%d") if ts_val > 1_000_000_000 else "recent")
-        )
+    for ts_sec, cid, cname, user_msgs in sessions_out[:max_sessions]:
+        date_str = _safe_fromtimestamp(ts_sec, "%Y-%m-%d", fallback="recent")
         ref = _format_chat_ref("douchat", str(cid))
-        block_lines = [f"## [{date_str}] {cname} (`ref: {ref}` · {len(user_msgs)} 轮人类输入)"]
+        block_lines = [f"## [{date_str}] {redact_all(cname)} (`ref: {ref}` · {len(user_msgs)} 轮人类输入)"]
         for m in user_msgs[:15]:
             block_lines.append(f"- {m.replace(chr(10), ' / ')}")
         block_lines.append("")
@@ -1453,7 +1418,7 @@ def extract_douchat_chats(
         lines.append(block)
         total_chars += len(block)
         used += 1
-        processed_ids.append(short_hash(f"douchat:{cid}:{ts_val}"))
+        processed_ids.append(short_hash(f"douchat:{cid}:{int(ts_sec)}"))
     return "\n".join(lines), used, processed_ids
 
 
@@ -1462,9 +1427,11 @@ def extract_eden_chats(
     days: int,
     max_sessions: int,
     max_chars: int = 38000,
+    skip_ids: set[str] | None = None,
 ) -> tuple[str, int, list[str]]:
     if not db_path_str or not Path(db_path_str).is_file():
         return "", 0, []
+    skip = skip_ids or set()
     lines: list[str] = [
         "# Eden 工作台本地历史对话精华（人类发言与意图流）",
         f"> 生成时间: {now_iso()} | 范围: 最近 {days} 天，最多 {max_sessions} 个活跃房间 | 只读安全提取。",
@@ -1479,7 +1446,7 @@ def extract_eden_chats(
     rooms_out: list[tuple[str, str, str, list[str]]] = []
 
     try:
-        conn = sqlite3.connect(f"file:{db_path_str}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_path_str)
         room_names = {
             r[0]: str(r[1] or r[0])
             for r in conn.execute("SELECT id, name FROM rooms").fetchall()
@@ -1493,6 +1460,8 @@ def extract_eden_chats(
         params = (cutoff_iso, max(max_sessions * 2, 40)) if cutoff_iso else (max(max_sessions * 2, 40),)
         active_rooms = conn.execute(q, params).fetchall()
         for rid, last_ts in active_rooms:
+            if str(rid) in skip:
+                continue
             mrows = conn.execute(
                 "SELECT content FROM messages WHERE room_id = ? AND sender_id = 'WebUser' AND type = 'chat' ORDER BY timestamp ASC LIMIT 200",
                 (rid,),
@@ -1513,7 +1482,12 @@ def extract_eden_chats(
     total_chars = 0
     used = 0
     processed_ids: list[str] = []
-    for date_str, rid, rname, user_msgs in rooms_out[:max_sessions]:
+    for date_str, rid, rname, user_msgs in rooms_out:
+        if used >= max_sessions:
+            break
+        fp = short_hash(f"eden:{rid}:{date_str}:{len(user_msgs)}")
+        if fp in skip or str(rid) in skip:
+            continue
         selected = user_msgs[:6] + ["…[中间轮次省略]…"] + user_msgs[-8:] if len(user_msgs) > 15 else user_msgs
         ref = _format_chat_ref("eden", str(rid))
         block_lines = [f"## [{date_str}] {rname} (`ref: {ref}` · {len(user_msgs)} 轮人类输入)"]
@@ -1526,7 +1500,7 @@ def extract_eden_chats(
         lines.append(block)
         total_chars += len(block)
         used += 1
-        processed_ids.append(short_hash(f"eden:{rid}:{date_str}:{len(user_msgs)}"))
+        processed_ids.append(fp)
     return "\n".join(lines), used, processed_ids
 
 
@@ -1535,9 +1509,11 @@ def extract_hermes_chats(
     days: int,
     max_sessions: int,
     max_chars: int = 38000,
+    skip_ids: set[str] | None = None,
 ) -> tuple[str, int, list[str]]:
     if not db_path_str or not Path(db_path_str).is_file():
         return "", 0, []
+    skip = skip_ids or set()
     lines: list[str] = [
         "# Hermes Agent 本地历史对话精华（人类发言与意图流）",
         f"> 生成时间: {now_iso()} | 范围: 最近 {days} 天，最多 {max_sessions} 场会话 | 只读安全提取。",
@@ -1545,19 +1521,29 @@ def extract_hermes_chats(
         "",
     ]
     cutoff_sec = (datetime.datetime.now().timestamp() - days * 86400) if days > 0 else 0.0
-    sessions_out: list[tuple[str, str, str, list[str]]] = []
+    sessions_out: list[tuple[float, str, str, str, list[str]]] = []
 
     try:
-        conn = sqlite3.connect(f"file:{db_path_str}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_path_str)
+        norm_ts_expr = (
+            "CASE WHEN COALESCE(last_activity_at, started_at, 0) > 1000000000000 "
+            "THEN COALESCE(last_activity_at, started_at, 0) / 1000.0 "
+            "ELSE COALESCE(last_activity_at, started_at, 0) END"
+        )
         q = (
-            "SELECT id, COALESCE(title, id), COALESCE(last_activity_at, started_at, 0) AS ts "
+            f"SELECT id, COALESCE(title, id), ({norm_ts_expr}) AS ts "
             "FROM sessions WHERE COALESCE(message_count, 0) > 0 "
-            + ("AND COALESCE(last_activity_at, started_at, 0) >= ? " if cutoff_sec else "")
+            + (f"AND ({norm_ts_expr}) >= ? " if cutoff_sec else "")
             + "ORDER BY ts DESC LIMIT ?"
         )
         params = (cutoff_sec, max(max_sessions * 2, 40)) if cutoff_sec else (max(max_sessions * 2, 40),)
         rows = conn.execute(q, params).fetchall()
         for sid, title, ts in rows:
+            if str(sid) in skip:
+                continue
+            sec = _ts_to_seconds(ts)
+            if cutoff_sec and sec > 946684800 and sec < cutoff_sec:
+                continue
             mrows = conn.execute(
                 "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 120",
                 (sid,),
@@ -1568,20 +1554,23 @@ def extract_hermes_chats(
                 if txt and len(txt) >= 4:
                     user_msgs.append(txt)
             if user_msgs:
-                sec = float(ts or 0)
-                if sec > 1_000_000_000_000:
-                    sec /= 1000.0
-                date_str = datetime.datetime.fromtimestamp(sec).strftime("%Y-%m-%d") if sec > 1_000_000_000 else "recent"
-                sessions_out.append((date_str, str(sid), str(title or sid)[:75], user_msgs))
+                date_str = _safe_fromtimestamp(sec, "%Y-%m-%d", fallback="recent")
+                sessions_out.append((sec, date_str, str(sid), redact_all(str(title or sid))[:75], user_msgs))
         conn.close()
     except Exception as e:
         lines.append(f"> *(读取 Hermes 数据库时跳过: {e})*")
         return "\n".join(lines), 0, []
 
+    sessions_out.sort(key=lambda x: x[0], reverse=True)
     total_chars = 0
     used = 0
     processed_ids: list[str] = []
-    for date_str, sid, title, user_msgs in sessions_out[:max_sessions]:
+    for _sec, date_str, sid, title, user_msgs in sessions_out:
+        if used >= max_sessions:
+            break
+        fp = short_hash(f"hermes:{sid}:{date_str}:{len(user_msgs)}")
+        if fp in skip or str(sid) in skip:
+            continue
         selected = user_msgs[:6] + ["…[中间轮次省略]…"] + user_msgs[-8:] if len(user_msgs) > 15 else user_msgs
         ref = _format_chat_ref("hermes", str(sid))
         block_lines = [f"## [{date_str}] {title} (`ref: {ref}` · {len(user_msgs)} 轮人类输入)"]
@@ -1594,7 +1583,7 @@ def extract_hermes_chats(
         lines.append(block)
         total_chars += len(block)
         used += 1
-        processed_ids.append(short_hash(f"hermes:{sid}:{date_str}:{len(user_msgs)}"))
+        processed_ids.append(fp)
     return "\n".join(lines), used, processed_ids
 
 
@@ -1665,9 +1654,11 @@ def extract_trae_chats(
     days: int,
     max_sessions: int,
     max_chars: int = 35000,
+    skip_ids: set[str] | None = None,
 ) -> tuple[str, int, list[str]]:
     if not base_dir_str or not Path(base_dir_str).is_dir():
         return "", 0, []
+    skip = skip_ids or set()
     ws_dir = Path(base_dir_str) / "User/workspaceStorage"
     if not ws_dir.is_dir():
         return "", 0, []
@@ -1678,8 +1669,8 @@ def extract_trae_chats(
         "> **按需下钻双边上下文**：若某场人类发言有价值但缺 AI 回复看不清来龙去脉，用标题中的 `ref` 执行 `tree chat read \"<ref>\" --turns 30` 调阅人+AI完整对话。",
         "",
     ]
-    cutoff_ms = (datetime.datetime.now().timestamp() - days * 86400) * 1000 if days > 0 else 0
-    sessions_found: list[tuple[int, str, str, str, list[str]]] = []
+    cutoff_sec = (datetime.datetime.now().timestamp() - days * 86400) if days > 0 else 0.0
+    sessions_found: list[tuple[float, str, str, str, list[str]]] = []
 
     for ws in ws_dir.iterdir():
         st = ws / "state.vscdb"
@@ -1695,7 +1686,7 @@ def extract_trae_chats(
                         ws_label = urllib.parse.unquote(fld.split("/")[-1])
                 except Exception:
                     pass
-            conn = sqlite3.connect(f"file:{st}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(st)
             rows = conn.execute(
                 "SELECT value FROM ItemTable WHERE key LIKE 'memento/icube-ai-%chat-storage-%'"
             ).fetchall()
@@ -1716,10 +1707,14 @@ def extract_trae_chats(
                     msgs = s.get("messages")
                     if not isinstance(msgs, list) or not msgs:
                         continue
-                    created = int(s.get("updatedAt") or s.get("createdAt") or 0)
-                    if cutoff_ms and created > 1_000_000_000_000 and created < cutoff_ms:
+                    created_raw = s.get("updatedAt") or s.get("createdAt") or 0
+                    created_sec = _ts_to_seconds(created_raw)
+                    if cutoff_sec and created_sec > 946684800 and created_sec < cutoff_sec:
                         continue
                     sid = str(s.get("sessionId") or s.get("id") or "")
+                    fp = short_hash(f"trae:{sid}:{int(created_sec)}")
+                    if fp in skip or (sid and sid in skip):
+                        continue
                     title = str(s.get("title") or s.get("name") or "").replace("\n", " ").strip()
                     user_msgs: list[str] = []
                     for m in msgs:
@@ -1733,7 +1728,7 @@ def extract_trae_chats(
                     if user_msgs:
                         tag = title or (user_msgs[0][:40] if user_msgs else sid[:8])
                         full_label = f"{tag} ({ws_label})" if ws_label and ws_label not in tag else tag
-                        sessions_found.append((created, sid, full_label, str(st), user_msgs))
+                        sessions_found.append((created_sec, sid, redact_all(full_label), str(st), user_msgs))
         except Exception:
             pass
 
@@ -1742,12 +1737,8 @@ def extract_trae_chats(
     used = 0
     processed_ids: list[str] = []
 
-    for created, sid, title, _st_path, user_msgs in sessions_found[:max_sessions]:
-        date_str = (
-            datetime.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
-            if created > 1_000_000_000_000
-            else (datetime.datetime.fromtimestamp(created).strftime("%Y-%m-%d") if created > 1_000_000_000 else "recent")
-        )
+    for created_sec, sid, title, _st_path, user_msgs in sessions_found[:max_sessions]:
+        date_str = _safe_fromtimestamp(created_sec, "%Y-%m-%d", fallback="recent")
         ref = _format_chat_ref("trae", str(sid))
         block_lines = [f"## [{date_str}] {title} (`ref: {ref}` · {len(user_msgs)} 轮人类输入)"]
         for m in user_msgs[:15]:
@@ -1759,7 +1750,7 @@ def extract_trae_chats(
         lines.append(block)
         total_chars += len(block)
         used += 1
-        processed_ids.append(short_hash(f"trae:{sid}:{created}"))
+        processed_ids.append(short_hash(f"trae:{sid}:{int(created_sec)}"))
 
     return "\n".join(lines), used, processed_ids
 
@@ -1769,27 +1760,29 @@ def extract_cursor_chats(
     days: int,
     max_sessions: int,
     max_chars: int = 35000,
+    skip_ids: set[str] | None = None,
 ) -> tuple[str, int, list[str]]:
     if not db_path_str or not Path(db_path_str).is_file():
         return "", 0, []
+    skip = skip_ids or set()
     lines: list[str] = [
         "# Cursor 本地历史对话精华（人类发言与意图流）",
         f"> 生成时间: {now_iso()} | 最多 {max_sessions} 场 Composer 对话 | 只读安全提取。",
         "> **按需下钻双边上下文**：若某场人类发言有价值但缺 AI 回复看不清来龙去脉，用标题中的 `ref` 执行 `tree chat read \"<ref>\" --turns 30` 调阅人+AI完整对话。",
         "",
     ]
-    cutoff_ms = (datetime.datetime.now().timestamp() - days * 86400) * 1000 if days > 0 else 0
-    sessions_found: list[tuple[int, str, str, list[str]]] = []
+    cutoff_sec = (datetime.datetime.now().timestamp() - days * 86400) if days > 0 else 0.0
+    sessions_found: list[tuple[float, str, str, list[str]]] = []
 
     try:
-        conn = sqlite3.connect(f"file:{db_path_str}?mode=ro", uri=True)
-        # Bound scan rows to protect against huge multi-GB state.vscdb files
+        conn = _connect_sqlite_ro(db_path_str)
+        # Order by rowid DESC so newest composers are always scanned first on large state.vscdb files
         cur = conn.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' LIMIT ?",
-            (max(max_sessions * 6, 200),),
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' ORDER BY rowid DESC LIMIT ?",
+            (max(max_sessions * 6, 400),),
         )
         for key, val in cur:
-            if not val:
+            if not val or str(key) in skip:
                 continue
             try:
                 obj = json.loads(val)
@@ -1797,10 +1790,14 @@ def extract_cursor_chats(
                 continue
             if not isinstance(obj, dict):
                 continue
-            created = int(obj.get("createdAt") or obj.get("lastUpdatedAt") or 0)
-            if cutoff_ms and created and created < cutoff_ms:
+            updated_raw = obj.get("lastUpdatedAt") or obj.get("createdAt") or 0
+            updated_sec = _ts_to_seconds(updated_raw)
+            if cutoff_sec and updated_sec > 946684800 and updated_sec < cutoff_sec:
                 continue
-            title = str(obj.get("name") or obj.get("text") or obj.get("composerId") or key)[:60].replace("\n", " ").strip()
+            fp = short_hash(f"cursor:{key}:{int(updated_sec)}")
+            if fp in skip or str(key) in skip:
+                continue
+            title = redact_all(str(obj.get("name") or obj.get("text") or obj.get("composerId") or key))[:60].replace("\n", " ").strip()
             user_msgs: list[str] = []
 
             # Old schema: inline conversation array
@@ -1840,7 +1837,7 @@ def extract_cursor_chats(
                     user_msgs.append(txt)
 
             if user_msgs:
-                sessions_found.append((created, key, title, user_msgs))
+                sessions_found.append((updated_sec, key, title, user_msgs))
         conn.close()
     except Exception as e:
         lines.append(f"> *(读取 Cursor 数据库时跳过: {e})*")
@@ -1851,12 +1848,8 @@ def extract_cursor_chats(
     used = 0
     processed_ids: list[str] = []
 
-    for created, key, title, user_msgs in sessions_found[:max_sessions]:
-        date_str = (
-            datetime.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
-            if created > 1_000_000_000_000
-            else "unknown-date"
-        )
+    for updated_sec, key, title, user_msgs in sessions_found[:max_sessions]:
+        date_str = _safe_fromtimestamp(updated_sec, "%Y-%m-%d", fallback="unknown-date")
         cid = key.split(":", 1)[-1]
         ref = _format_chat_ref("cursor", cid)
         block_lines = [f"## [{date_str}] {title or key} (`ref: {ref}` · {len(user_msgs)} 轮人类输入)"]
@@ -1869,7 +1862,7 @@ def extract_cursor_chats(
         lines.append(block)
         total_chars += len(block)
         used += 1
-        processed_ids.append(short_hash(f"cursor:{key}:{created}"))
+        processed_ids.append(short_hash(f"cursor:{key}:{int(updated_sec)}"))
 
     return "\n".join(lines), used, processed_ids
 
@@ -1883,13 +1876,16 @@ def parse_generic_conversations_json(data: Any, max_sessions: int = 60) -> list[
     results: list[tuple[str, str, list[str]]] = []
 
     if isinstance(data, dict):
-        # Single conversation or wrapper dict
-        for key in ("conversations", "chats", "sessions", "data", "messages"):
-            if isinstance(data.get(key), list):
-                data = data[key]
-                break
-        else:
+        # Single conversation object with metadata (`title`/`name` + `messages`) must keep its metadata
+        if isinstance(data.get("messages"), list) and any(k in data for k in ("title", "name", "created_at", "create_time", "updated_at", "update_time")):
             data = [data]
+        else:
+            for key in ("conversations", "chats", "sessions", "data", "messages"):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+            else:
+                data = [data]
 
     if not isinstance(data, list):
         return results
@@ -1917,8 +1913,7 @@ def parse_generic_conversations_json(data: Any, max_sessions: int = 60) -> list[
         ts = conv.get("update_time") or conv.get("create_time") or conv.get("updated_at") or conv.get("created_at")
         date_str = ""
         if isinstance(ts, (int, float)) and ts > 1_000_000_000:
-            sec = ts / 1000 if ts > 1_000_000_000_000 else ts
-            date_str = datetime.datetime.fromtimestamp(sec).strftime("%Y-%m-%d")
+            date_str = _safe_fromtimestamp(ts, "%Y-%m-%d", fallback="")
         elif isinstance(ts, str) and len(ts) >= 10:
             date_str = ts[:10]
 
@@ -1965,7 +1960,7 @@ def parse_generic_conversations_json(data: Any, max_sessions: int = 60) -> list[
 
 
 def import_external_path(root: Path, src_path: Path, label: str = "", max_chars: int = 45000) -> tuple[Path, int]:
-    """Import an official export file (ZIP/JSON/JSONL/MD/TXT) or directory into `seed/staging/`."""
+    """Import an official export file (ZIP/JSON/JSONL/MD/TXT) or directory into `.tree/staging/`."""
     src_path = src_path.expanduser().resolve()
     if not src_path.exists():
         raise FileNotFoundError(f"导入路径不存在: {src_path}")
@@ -2003,6 +1998,29 @@ def import_external_path(root: Path, src_path: Path, label: str = "", max_chars:
             if not append_block("\n".join(blk)):
                 break
 
+    def _is_binary_bytes(raw_b: bytes) -> bool:
+        return b"\x00" in raw_b[:4096]
+
+    def _import_jsonl_text(raw_text: str, title_name: str) -> None:
+        msgs: list[str] = []
+        for raw_line in raw_text.splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                obj = json.loads(raw_line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            role = str(obj.get("role") or obj.get("type") or "").lower()
+            if role in ("user", "human", "user_input"):
+                txt = clean_chat_text(extract_text_from_content(obj.get("content") or obj.get("message")), max_len=450)
+                if txt:
+                    msgs.append(txt)
+        if msgs:
+            blk = [f"## `{title_name}` ({len(msgs)} 条人类输入)"] + [f"- {m.replace(chr(10), ' / ')}" for m in msgs[:80]]
+            append_block("\n".join(blk) + "\n")
+
     if src_path.is_file():
         suf = src_path.suffix.lower()
         if suf == ".zip":
@@ -2012,48 +2030,52 @@ def import_external_path(root: Path, src_path: Path, label: str = "", max_chars:
                     if low.endswith(".json") and ("conversation" in low or "chat" in low or "message" in low or len(zf.namelist()) <= 5):
                         handle_json_bytes(zf.read(name), name)
                     elif low.endswith((".md", ".txt")):
-                        txt = redact_secrets(zf.read(name).decode("utf-8", errors="ignore").strip())
+                        raw_b = zf.read(name)
+                        if _is_binary_bytes(raw_b):
+                            continue
+                        txt = redact_all(raw_b.decode("utf-8", errors="ignore").strip())
                         if txt:
                             if not append_block(f"## `{name}`\n{txt[:2500]}\n"):
                                 break
         elif suf == ".json":
             handle_json_bytes(src_path.read_bytes(), src_path.name)
         elif suf == ".jsonl":
-            msgs: list[str] = []
-            for raw_line in src_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if not raw_line.strip():
-                    continue
-                try:
-                    obj = json.loads(raw_line)
-                except Exception:
-                    continue
-                role = str(obj.get("role") or obj.get("type") or "").lower()
-                if role in ("user", "human", "user_input"):
-                    txt = clean_chat_text(extract_text_from_content(obj.get("content") or obj.get("message")), max_len=450)
-                    if txt:
-                        msgs.append(txt)
-            if msgs:
-                blk = [f"## `{src_path.name}` ({len(msgs)} 条人类输入)"] + [f"- {m.replace(chr(10), ' / ')}" for m in msgs[:80]]
-                append_block("\n".join(blk) + "\n")
+            _import_jsonl_text(src_path.read_text(encoding="utf-8", errors="ignore"), src_path.name)
         else:
-            txt = redact_secrets(src_path.read_text(encoding="utf-8", errors="ignore").strip())
+            raw_b = src_path.read_bytes()
+            if _is_binary_bytes(raw_b):
+                raise ValueError(f"不支持导入二进制文件: {src_path.name}")
+            txt = redact_all(raw_b.decode("utf-8", errors="ignore").strip())
             if txt:
-                append_block(f"## `{src_path.name}`\n{txt[:max_chars]}\n")
+                prefix = f"## `{src_path.name}`\n"
+                trunc_suffix = "\n…[已截断]"
+                budget = max(200, max_chars - len(prefix) - len(trunc_suffix) - 2)
+                snippet = (txt[:budget].rstrip() + trunc_suffix) if len(txt) > budget else txt
+                append_block(f"{prefix}{snippet}\n")
     elif src_path.is_dir():
         files = sorted(
-            [p for p in src_path.rglob("*") if p.is_file() and p.suffix.lower() in {".md", ".txt", ".json"}],
+            [p for p in src_path.rglob("*") if p.is_file() and p.suffix.lower() in {".md", ".txt", ".json", ".jsonl"}],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
         for f in files[:60]:
-            if f.suffix.lower() == ".json":
-                handle_json_bytes(f.read_bytes(), str(f.relative_to(src_path)))
+            suf_f = f.suffix.lower()
+            if suf_f == ".json":
+                handle_json_bytes(f.read_bytes(), f.relative_to(src_path).as_posix())
+            elif suf_f == ".jsonl":
+                _import_jsonl_text(f.read_text(encoding="utf-8", errors="ignore"), f.relative_to(src_path).as_posix())
             else:
-                txt = redact_secrets(f.read_text(encoding="utf-8", errors="ignore").strip())
+                raw_b = f.read_bytes()
+                if _is_binary_bytes(raw_b):
+                    continue
+                txt = redact_all(raw_b.decode("utf-8", errors="ignore").strip())
                 if txt:
-                    rel = f.relative_to(src_path)
+                    rel = f.relative_to(src_path).as_posix()
                     if not append_block(f"## `{rel}` [{file_mtime_iso(f)}]\n{txt[:2000]}\n"):
                         break
+
+    if item_count == 0:
+        raise ValueError(f"未从 `{src_path.name}` 解析到有效文本素材（文件可能为空或格式不受支持）")
 
     out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2066,7 +2088,7 @@ def import_external_path(root: Path, src_path: Path, label: str = "", max_chars:
             "timestamp": now_iso(),
             "source": str(src_path),
             "label": label or src_path.name,
-            "staging_file": str(out_file.relative_to(root)),
+            "staging_file": out_file.relative_to(root).as_posix(),
             "items": item_count,
         }
     )
@@ -2079,7 +2101,7 @@ def write_staging_manifest(root: Path, files_meta: list[dict[str, Any]]) -> Path
     manifest = staging_dir(root) / "00-manifest.md"
     lines = [
         "# Tree Seed 破土素材总览（待宿主 Agent 蒸馏）",
-        f"> 生成时间: {now_iso()} | 位置: `seed/staging/`（已加入 `.gitignore`，不污染 Git 树干）",
+        f"> 生成时间: {now_iso()} | 位置: `.tree/staging/`（已加入 `.gitignore`，不污染 Git 树干）",
         "",
         "## 一、已生成的清洗素材包",
     ]
@@ -2089,23 +2111,14 @@ def write_staging_manifest(root: Path, files_meta: list[dict[str, Any]]) -> Path
     lines.extend(
         [
             "",
-            "## 二、给宿主 Agent 的破土蒸馏协议",
-            "1. **先读根契约**：写入前必先执行 `tree read README.md`。",
-            "2. **记忆文件与对话精华均走「轻扫描 → 按需精读/下钻」，不要盲目全吞**：",
-            "   - **本地记忆**：已全量索引在 `memories-index.md`（零截断，含各客户端与项目分组）。请先通览索引，挑出全局画像/规则、仍在推进项目的 `MEMORY.md` 或近期高价值记录，直接读取原文件或用 `tree seed read \"<文件路径>\"` 只读读取（自动脱敏并剥离 Tree 自身同步块）。",
-            "   - **历史对话（按需调阅人+AI 双边上下文）**：`chats-*.md` 默认只抽人类发言流用于低成本初筛，每场对话标题均带有可直达句柄 `` `ref: <source>:<id前缀>` ``。当你发现某场对话里人类发言很有价值，但离开 AI 回复看不清前因后果（如「就按第 2 个方案」「这个不行」「按刚才说的定」）时，**主动执行 `tree chat read \"<source>:<id前缀>\" --turns 30` 拉取该场对话的人+AI 双边上下文**，看清全貌后再提炼，严禁只凭半截人类发言瞎猜。",
-            "   - **第三方外脑与记忆系统**：用户本机或云端可能还装有其他外部大脑或个人知识库（如得到大脑、Mem0、Obsidian、OpenMemory、MCP 记忆服务或自定义记忆目录）。请主动向用户确认，经授权后将已消化的长期核心判断梳理入 `01~04`，并将该外脑的范围、检索方式（MCP/Skill/CLI/本地路径）与核心目录索引登记进 `seed/外部上下文源.md`。",
-            "3. **先求完整清晰，拒绝无头碎片（适用于 01~04 与 seed/ 所有页面）**：",
-            "   - 聊天记录天然是碎片化的（临时排错、局部指令），**严禁把几段聊天碎片直接拼成一页**。无论写 `01` 个人情况、`02` 思考判断、`03` 项目、`04` 工作规范还是 `seed/` 外脑与精选收藏，都要保证**一个没看过历史聊天的人/AI 读完这页，能独立看懂完整上下文和来龙去脉**。",
-            "   - **主动补全信息源**：写 `03` 项目或工具时，先去读 `--location` 目录下的现有文档/代码入口，结合聊天记录还原完整面貌；写 `02` 或 `04` 时，把结论背后的原因、适用场景和边界讲清楚，不写没头没尾的孤立条目。",
-            "   - **参考落点（严格对齐 `README.md` 推荐子分类，宁缺毋滥）**：",
-            "     - `01-关于我/`：客观事实放 `基本信息.md`、`习惯偏好.md`、`设备与资产.md`；**`价值观.md` 与 `长期目标.md` 只记录用户亲口表达过的人生信条、梦想与 3~5 年职业/人生大方向**——严禁把近期高频推进的具体项目反推拔高成“长期目标”，素材里没有就留空不建，不要强行填满常驻位。",
-            "     - `03-我正在做的事/`：已动手推进的事项归入 `工作/`、`学习/`、`生活/`（长期项目建 `工作/<项目名>/项目总览.md` 并标 `--kind project --location \"<路径或链接>\"`）。**严守 Tree 个人上下文定位（只记 User Context，不记 Repo Context）**：站在项目主人的视角写清「① 项目背景与核心价值 → ② 已经做成了什么（产品成果与核心机制） → ③ 核心产品拍板与否决取舍 → ④ 接下来做什么与演进规划 → ⑤ 从项目中沉淀的核心教训 + 外部入口索引」；**严禁把代码仓里的函数名、类名、DOM 选择器、单测补丁等代码实现细节搬进 Tree，更严禁按技术模块拆出 `Agent接入.md`、`测试与发版.md` 这类代码说明书**（代码细节一律留给 `--location` 仓库本地的 `CLAUDE.md`/`docs/`）。",
-            "     - `02-我的思考/` 与 `04-我如何工作/`：跨项目独立思考与随笔放 `02`；跨任务可复用的协作底线（`--always`）与工作规范放 `04`。",
-            "     - `seed/`（外脑与精选收藏隔离区，标 `--no-always`，由 AI 替用户全权动态维护）：根据用户当前真实可用的外部数据源（`tree seed scan` 已就绪源、本机已挂载的外部数据类 MCP/Skill、以及用户接入的得到大脑/抖音/Obsidian 等外脑）主动创建或原地更新 `seed/外部上下文源.md`（千人千面、随增随减，只记真实存在的源范围、检索入口与目录索引，不搬原文）；尚未内化成个人观点但值得留给 AI 参考的好文章、好工具记入 `seed/文章与链接.md`、`seed/工具与资源.md`（只记标题 + 链接 + 一句话收藏理由）。",
-            "4. **信息不足就先问人，严禁硬编或反推脑补**：只要素材拼不出完整清晰的页面（尤其是 `01/长期目标`、`01/价值观` 这类高维底色页），要么留空不建，要么先向用户提出具体问题补齐，再呈报「初始 Tree 破土草案」。",
-            "5. **经人类确认后再落盘**：草案经用户删改拍板后，逐页调用 `tree write` 写入。",
-            "6. **落盘后清理土壤**：写入完成后可执行 `tree seed clear` 清理临时暂存文件（保留游标索引）。",
+            "## 二、本次破土蒸馏流程",
+            "1. **先读唯一内容契约**：写入前必先执行 `tree rules`（即根目录 `README.md`），所有分类归属、来源分级（`--origin`/`--source`）与写作红线以此为准。",
+            "2. **轻扫描 → 按需下钻，不要盲目全吞**：",
+            "   - **本地记忆**：已全量索引在 `memories-index.md`。先挑出全局画像、活跃项目与近期高价值记录，直接读原文件或用 `tree seed read \"<文件路径>\"`（自动脱敏）。",
+            "   - **历史对话**：`chats-*.md` 默认只抽人类发言流用于初筛；遇到缺 AI 回复看不清上下文的场次，按标题里的 `` `ref: <source>:<id前缀>` `` 执行 `tree chat read \"<source>:<id前缀>\" --turns 30` 拉取双边对话。",
+            "   - **当前工具独有的个人数据源**：若当前宿主连着其他 AI 看不到的外部数据（电商、外卖买菜、运动健康、笔记、播客等），一并调用提炼稳定的习惯、入口线索和后续别的 AI 也用得上的日常记录。",
+            "3. **合并碎片，补齐全貌**：严禁把几段聊天碎片直接拼成一页；整理长期项目时结合 `--location` 目录已有文档还原来龙去脉；素材不足先问用户，不脑补。",
+            "4. **确认后落盘并清理**：呈报破土草案经用户拍板后逐页 `tree write`，完成后执行 `tree seed clear` 清空 `.tree/staging/` 临时文件。",
         ]
     )
     manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2113,7 +2126,7 @@ def write_staging_manifest(root: Path, files_meta: list[dict[str, Any]]) -> Path
 
 
 def list_staging_files(root: Path) -> list[Path]:
-    sd = seed_dir(root) / "staging"
+    sd = root / ".tree" / "staging"
     if not sd.is_dir():
         return []
     return sorted(p for p in sd.glob("*.md") if p.is_file())
@@ -2123,8 +2136,15 @@ def list_staging_files(root: Path) -> list[Path]:
 # CLI Command Handlers
 # ---------------------------------------------------------------------------
 
+def _pad_display(text: str, width: int) -> str:
+    import unicodedata
+
+    disp = sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+    return text + (" " * max(1, width - disp))
+
+
 def cmd_seed_scan(root: Path, _args: Any, log_audit: Callable[..., None]) -> None:
-    discovered, plugins = scan_all_local_sources(root)
+    discovered = scan_all_local_sources(root)
     state = load_sources_state(root)
     state["detected"] = {
         k: {
@@ -2133,14 +2153,13 @@ def cmd_seed_scan(root: Path, _args: Any, log_audit: Callable[..., None]) -> Non
             "memory_count": len(v.get("memory_files", [])) + int(v.get("memory_db_count", 0)),
             "chat_count": len(v.get("chat_files", [])) if "chat_files" in v else int(v.get("chat_count", 0)),
             "latest_date": v.get("latest_date", ""),
-            "is_plugin": bool(v.get("is_plugin", False)),
         }
         for k, v in discovered.items()
     }
     save_sources_state(root, state)
-    log_audit(root, "seed:scan", "seed/sources.json")
+    log_audit(root, "seed:scan", ".tree/sources.json")
 
-    print("🌱 Tree Seed 认知与上下文来源探测结果（只读扫描，未提取任何正文）：\n")
+    print("🌱 Tree Seed 本机记忆与对话源探测结果（12 项内置本地只读源，未提取任何正文）：\n")
     available_ids: list[str] = []
     for sid, info in discovered.items():
         mem_n = len(info.get("memory_files", [])) + int(info.get("memory_db_count", 0))
@@ -2148,58 +2167,36 @@ def cmd_seed_scan(root: Path, _args: Any, log_audit: Callable[..., None]) -> Non
         if info["available"]:
             status = "✅ 已就绪"
             available_ids.append(sid)
-        elif info.get("needs_login"):
-            status = "🔑 需登录"
         else:
             status = "—  未发现"
         latest = f" | 最近活跃: {info['latest_date']}" if info.get("latest_date") else ""
-        detail_hint = f" | {info['detail']}" if (info.get("is_plugin") and info.get("detail") and not info["available"]) else ""
-        ptag = " [插件]" if info.get("is_plugin") else ""
         unit = info.get("unit_label")
-        if unit in ("已登录", "可扫码"):
-            count_col = f"状态: {unit:<10}"
-        elif unit:
-            count_col = f"记录: {chat_n:>4} {unit}"
-        else:
-            count_col = f"记忆/规则: {mem_n:>3} 份 | 历史对话: {chat_n:>4} 场"
-        print(f"  [{sid:<11}] {status}  {info['name']:<24}{ptag} {count_col}{latest}{detail_hint}")
+        count_col = f"记录: {chat_n:>4} {unit}" if unit else f"记忆/规则: {mem_n:>3} 份 | 历史对话: {chat_n:>4} 场"
+        print(f"  [{sid:<11}] {status}  {_pad_display(info['name'], 24)} {count_col}{latest}")
 
-    print("\n📦 按需扩展外部连接器与导出包（托管于 GitHub `shangxiuyu/water`）：")
-    missing_zero_dep = [cid for cid in ("getnote", "flomo", "weread", "jike") if cid not in discovered]
-    if missing_zero_dep:
-        print(f"  ① 零依赖外部外脑/社区（下载即用）：`tree seed add {','.join(missing_zero_dep)}`")
-    print("  ② 查看/安装全部外部外脑与生活连接器（得到大脑/flomo/微信读书/即刻/美团/淘宝盒马/叮咚/京东/闲鱼/Keep/微信）：")
-    print("     运行 `tree seed add --list` 查看清单，或运行 `tree seed add <平台ID>` 按需下载到 `seed/connectors/`。")
-    print("  ③ 网页端官方导出包（ChatGPT / Claude Web / Obsidian 等）：`tree seed import <文件或目录路径> --label <来源名>`")
-    print("  ④ 自定义本地连接器：在 `seed/connectors/<name>.py` 实现 `discover()` 与 `extract()` 即可自动挂载。")
+    print("\n📦 其他本地导入方式：")
+    print("  · 官方导出包或本地笔记目录（ChatGPT / Claude Web / Obsidian 等）：`tree seed import <文件或目录路径> --label <来源名>`")
 
     if available_ids:
         src_list = ",".join(available_ids)
-        print("\n🚀 下一步（经你确认授权后执行清洗提取，并由 AI 自动为你创建/更新 `seed/外部上下文源.md`）：")
+        print("\n🚀 下一步（经你确认授权后执行本地清洗提取，暂存 `.tree/staging/`）：")
         print(f"  tree seed extract --sources {src_list} --days 60")
 
 
 def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> None:
-    discovered, plugins = scan_all_local_sources(root)
+    discovered = scan_all_local_sources(root)
     if args.sources:
-        selected = {SOURCE_ALIASES.get(s.strip().lower(), s.strip().lower()) for s in args.sources.split(",") if s.strip()}
+        selected = {s.strip().lower() for s in args.sources.split(",") if s.strip()}
     else:
         selected = {k for k, v in discovered.items() if v["available"]}
 
     valid_ids = set(discovered.keys())
     unknown = selected - valid_ids
     if unknown:
-        water_hits = sorted(unknown & set(KNOWN_WATER_CONNECTORS))
-        if water_hits:
-            print(
-                f"❌ 连接器 `{', '.join(water_hits)}` 尚未安装到本机。可先运行 `tree seed add {','.join(water_hits)}` 从 GitHub `water` 仓库按需拉取安装。",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"❌ 未知来源标识: {', '.join(sorted(unknown))}（当前可用: {', '.join(sorted(valid_ids))}）",
-                file=sys.stderr,
-            )
+        print(
+            f"❌ 未知来源标识: {', '.join(sorted(unknown))}（内置本机源: {', '.join(sorted(valid_ids))}）",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     sd = staging_dir(root)
@@ -2235,6 +2232,13 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
             )
 
     # 2. Chat histories per selected source
+    full_reextract = bool(getattr(args, "full", False))
+
+    def _skip_for(sid: str) -> set[str]:
+        return set() if full_reextract else set(proc_map.get(sid) or [])
+
+    had_prior_cursors = (not full_reextract) and any(proc_map.get(sid) for sid in selected)
+
     if not args.memories_only:
         if "claude" in selected and discovered["claude"]["chat_files"]:
             md, cnt, pids = extract_jsonl_source_chats(
@@ -2244,7 +2248,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 parse_claude_session,
                 days=args.days,
                 max_sessions=args.max_sessions,
-                skip_ids=set(proc_map.get("claude") or []),
+                skip_ids=_skip_for("claude"),
             )
             if cnt > 0:
                 out_p = sd / "chats-claude.md"
@@ -2260,7 +2264,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 parse_codex_session,
                 days=args.days,
                 max_sessions=args.max_sessions,
-                skip_ids=set(proc_map.get("codex") or []),
+                skip_ids=_skip_for("codex"),
             )
             if cnt > 0:
                 out_p = sd / "chats-codex.md"
@@ -2276,7 +2280,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 parse_antigravity_session,
                 days=args.days,
                 max_sessions=args.max_sessions,
-                skip_ids=set(proc_map.get("antigravity") or []),
+                skip_ids=_skip_for("antigravity"),
             )
             if cnt > 0:
                 out_p = sd / "chats-antigravity.md"
@@ -2289,6 +2293,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 discovered["cursor"]["db_path"],
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("cursor"),
             )
             if cnt > 0:
                 out_p = sd / "chats-cursor.md"
@@ -2301,6 +2306,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 discovered["trae"]["base_path"],
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("trae"),
             )
             if cnt > 0:
                 out_p = sd / "chats-trae.md"
@@ -2316,6 +2322,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 parse_workbuddy_session,
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("workbuddy"),
             )
             if cnt > 0:
                 out_p = sd / "chats-workbuddy.md"
@@ -2328,6 +2335,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 discovered["douchat"]["db_path"],
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("douchat"),
             )
             if cnt > 0:
                 out_p = sd / "chats-douchat.md"
@@ -2340,6 +2348,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 discovered["hermes"]["db_path"],
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("hermes"),
             )
             if cnt > 0:
                 out_p = sd / "chats-hermes.md"
@@ -2352,6 +2361,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 discovered["eden"]["db_path"],
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("eden"),
             )
             if cnt > 0:
                 out_p = sd / "chats-eden.md"
@@ -2367,6 +2377,7 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 parse_deepseek_session,
                 days=args.days,
                 max_sessions=args.max_sessions,
+                skip_ids=_skip_for("deepseek"),
             )
             if cnt > 0:
                 out_p = sd / "chats-deepseek.md"
@@ -2375,50 +2386,39 @@ def cmd_seed_extract(root: Path, args: Any, log_audit: Callable[..., None]) -> N
                 proc_map["deepseek"] = list(dict.fromkeys((proc_map.get("deepseek") or []) + pids))[-500:]
 
         if "chrome" in selected and discovered["chrome"]["available"]:
-            md, cnt, pids = extract_chrome_context(days=args.days, max_sessions=args.max_sessions)
+            md, cnt, pids = extract_chrome_context(
+                days=args.days,
+                max_sessions=args.max_sessions,
+                skip_ids=_skip_for("chrome"),
+            )
             if cnt > 0 and md:
                 out_p = sd / "context-chrome.md"
                 out_p.write_text(md, encoding="utf-8")
                 files_meta.append({"rel_path": str(out_p.relative_to(root)), "desc": f"Google Chrome 书签与高频站点（{cnt} 条）", "chars": len(md)})
                 proc_map["chrome"] = list(dict.fromkeys((proc_map.get("chrome") or []) + pids))[-500:]
 
-        # Execute any selected plugin connectors from `seed/connectors/`
-        helpers = get_connector_helpers()
-        for cid, mod in plugins.items():
-            if cid not in selected or not callable(getattr(mod, "extract", None)):
-                continue
-            try:
-                md, cnt, pids = mod.extract(args.days, args.max_sessions, helpers)
-                if cnt > 0 and md:
-                    out_p = sd / f"context-{cid}.md"
-                    out_p.write_text(md, encoding="utf-8")
-                    cname = discovered[cid].get("name", cid)
-                    files_meta.append({"rel_path": str(out_p.relative_to(root)), "desc": f"{cname} 提炼线索（{cnt} 条）", "chars": len(md)})
-                    proc_map[cid] = list(dict.fromkeys((proc_map.get(cid) or []) + (pids or [])))[-500:]
-            except Exception as e:
-                print(f"⚠️ 连接器 `{cid}` 提取失败（已跳过）: {e}", file=sys.stderr)
-
     # Include any previously imported files in manifest
     for existing in list_staging_files(root):
         if existing.name.startswith("import-"):
-            rel = str(existing.relative_to(root))
-            files_meta.append({"rel_path": rel, "desc": f"外部导入素材（{existing.name}）", "chars": existing.stat().st_size})
+            rel = existing.relative_to(root).as_posix()
+            files_meta.append({"rel_path": rel, "desc": f"外部导入素材（{existing.name}）", "chars": len(existing.read_text(encoding="utf-8", errors="ignore"))})
 
     state["processed_sessions"] = proc_map
     save_sources_state(root, state)
 
     if not files_meta:
-        print("⚠️ 未在所选来源与时间窗口内提取到有效素材。可尝试扩大 --days 或使用 `tree seed import <路径>`。")
+        hint = "（部分会话可能已被增量游标跳过，加 `--full` 可全量重新提取）" if had_prior_cursors else ""
+        print(f"⚠️ 未在所选来源与时间窗口内提取到新的有效素材{hint}。也可扩大 `--days` 或使用 `tree seed import <路径>`。")
         return
 
     manifest = write_staging_manifest(root, files_meta)
     log_audit(root, "seed:extract", ",".join(sorted(selected)), detail=f"files={len(files_meta)}")
 
-    print("✅ 已完成本地清洗与密钥脱敏，素材已暂存至 `seed/staging/`（Git 已忽略，绝不污染树干）：\n")
+    print("✅ 已完成本地清洗与密钥脱敏，素材已暂存至 `.tree/staging/`（Git 已忽略，绝不污染树干）：\n")
     for item in files_meta:
         print(f"  📄 {item['rel_path']} — {item['desc']} ({item['chars']:,} 字符)")
     print(f"\n🗺️ 总览与蒸馏协议: `{manifest.relative_to(root)}`")
-    print("👉 下一步：在任意宿主 Agent 中说「读一下 seed/staging/，帮我起草 Tree 初始化破土方案」，确认后落盘。")
+    print("👉 下一步：在任意宿主 Agent 中说「读一下 .tree/staging/，帮我起草 Tree 初始化破土方案」，确认后落盘。")
 
 
 def cmd_seed_read(root: Path, args: Any, log_audit: Callable[..., None]) -> None:
@@ -2438,7 +2438,7 @@ def cmd_seed_read(root: Path, args: Any, log_audit: Callable[..., None]) -> None
         sys.exit(1)
 
     had_tree_block = bool(TREE_CONTEXT_BLOCK_RE.search(raw))
-    cleaned = redact_secrets(strip_tree_context_block(raw))
+    cleaned = redact_all(strip_tree_context_block(raw))
     max_chars = int(getattr(args, "max_chars", 12000) or 0)
     truncated = False
     if max_chars > 0 and len(cleaned) > max_chars:
@@ -2471,38 +2471,17 @@ def cmd_seed_import(root: Path, args: Any, log_audit: Callable[..., None]) -> No
     for p in list_staging_files(root):
         if p.name == "00-manifest.md":
             continue
-        files_meta.append({"rel_path": str(p.relative_to(root)), "desc": p.stem, "chars": p.stat().st_size})
+        files_meta.append({"rel_path": str(p.relative_to(root)), "desc": p.stem, "chars": len(p.read_text(encoding="utf-8", errors="ignore"))})
     write_staging_manifest(root, files_meta)
     log_audit(root, "seed:import", str(args.path), detail=f"items={count}")
     print(f"✅ 已导入并清洗 {count} 条素材至 `{out_p.relative_to(root)}`（已自动脱敏，不进 Git 仓库）")
-    print("👉 可在任意宿主 Agent 中读取 `seed/staging/00-manifest.md` 并生成破土提案。")
+    print("👉 可在任意宿主 Agent 中读取 `.tree/staging/00-manifest.md` 并生成破土提案。")
 
 
 def cmd_seed_status(root: Path, _args: Any, _log_audit: Callable[..., None]) -> None:
     state = load_sources_state(root)
     staged = list_staging_files(root)
-    v_seed_dir = root / "seed"
-    persisted_seed_files = (
-        sorted(
-            p
-            for p in v_seed_dir.rglob("*.md")
-            if p.is_file()
-            and p.name.lower() != "readme.md"
-            and "staging" not in p.relative_to(v_seed_dir).parts
-            and "connectors" not in p.relative_to(v_seed_dir).parts
-        )
-        if v_seed_dir.is_dir()
-        else []
-    )
-    print("🌱 Tree Seed 统一种子区状态 (seed/)\n")
-    print(f"一、外脑与精选收藏持久页（`seed/`，进 Git，共 {len(persisted_seed_files)} 篇）：")
-    if persisted_seed_files:
-        for pf in persisted_seed_files:
-            print(f"  📄 {pf.relative_to(root)} ({pf.stat().st_size:,} bytes)")
-    else:
-        print("  (尚未建立外脑源或精选收藏页，可按需写入 `seed/外部上下文源.md`、`seed/文章与链接.md` 等)")
-
-    print("\n二、本机采集源与临时抽取缓存（`seed/sources.json` & `seed/staging/`，Git 忽略）：")
+    print("🌱 Tree Seed 本机迁移与暂存状态（`.tree/sources.json` & `.tree/staging/`）\n")
     if state.get("updated_at"):
         print(f"最近扫描: {state['updated_at']}")
     detected = state.get("detected") or {}
@@ -2517,13 +2496,22 @@ def cmd_seed_status(root: Path, _args: Any, _log_audit: Callable[..., None]) -> 
     print(f"\n待蒸馏暂存素材 ({len(staged)} 个文件):")
     if staged:
         for p in staged:
-            print(f"  📄 seed/staging/{p.name} ({p.stat().st_size:,} bytes)")
+            print(f"  📄 .tree/staging/{p.name} ({p.stat().st_size:,} bytes)")
     else:
         print("  (空 — 已保持洁净)")
 
+    v_seed_dir = root / "seed"
+    if v_seed_dir.is_dir():
+        legacy_files = sorted(
+            p for p in v_seed_dir.rglob("*.md")
+            if p.is_file() and p.name.lower() != "readme.md"
+        )
+        if legacy_files:
+            print(f"\n⚠️ 检测到遗留 `seed/` 目录（{len(legacy_files)} 篇）：建议按主题归并至 `01~04` 并通过 `--origin external` 标注来源。")
+
 
 def cmd_seed_clear(root: Path, _args: Any, log_audit: Callable[..., None]) -> None:
-    sd = seed_dir(root) / "staging"
+    sd = root / ".tree" / "staging"
     removed = 0
     if sd.is_dir():
         for p in list(sd.iterdir()):
@@ -2533,244 +2521,8 @@ def cmd_seed_clear(root: Path, _args: Any, log_audit: Callable[..., None]) -> No
             elif p.is_dir():
                 shutil.rmtree(p)
                 removed += 1
-    log_audit(root, "seed:clear", "seed/staging", detail=f"removed={removed}")
-    print(f"🧹 已清空 `seed/staging/`（移除 {removed} 个临时暂存文件，保留 seed/*.md 持久页与 sources.json 增量游标）。")
-
-
-def _safe_rel_subpath(raw_rel: str, strip_prefix: str = "") -> Path:
-    """Validate and normalize a relative path from an external manifest (forbids traversal and absolute paths)."""
-    cleaned = str(raw_rel or "").replace("\\", "/").strip()
-    if not cleaned or cleaned.startswith("/") or re.match(r"^[A-Za-z]:", cleaned) or "\x00" in cleaned:
-        raise ValueError(f"非法相对路径: {raw_rel!r}")
-    if strip_prefix:
-        norm_pref = strip_prefix.strip("/") + "/"
-        if cleaned.startswith(norm_pref):
-            cleaned = cleaned[len(norm_pref):]
-    cleaned = cleaned.strip("/")
-    if not cleaned or cleaned == ".":
-        raise ValueError(f"空相对路径或目录占位: {raw_rel!r}")
-    raw_parts = cleaned.split("/")
-    if any(part in ("", ".", "..") for part in raw_parts):
-        raise ValueError(f"路径禁止包含穿越或空段: {raw_rel!r}")
-    return Path(*raw_parts)
-
-
-def _read_water_resource(rel_path: str, source_override: str = "") -> bytes:
-    """Fetch a file from local water directory (if specified) or GitHub `shangxiuyu/water`."""
-    safe_rel = _safe_rel_subpath(rel_path)
-    src = (source_override or os.environ.get("TREE_WATER_SOURCE") or "").strip()
-    if src:
-        local_dir = Path(src).expanduser().resolve()
-        if local_dir.is_dir():
-            target = (local_dir / safe_rel).resolve()
-            if not target.is_relative_to(local_dir):
-                raise ValueError(f"越界路径被拦截: {rel_path}")
-            if not target.is_file():
-                raise FileNotFoundError(f"本地源目录中不存在文件: {target}")
-            return target.read_bytes()
-        base_url = src.rstrip("/")
-    else:
-        base_url = DEFAULT_WATER_REPO.rstrip("/")
-
-    url = f"{base_url}/{safe_rel.as_posix().lstrip('/')}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Tree-Seed-CLI/2.0 (https://github.com/shangxiuyu/Tree)"},
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.read()
-
-
-def cmd_seed_login(root: Path, args: Any, log_audit: Callable[..., None]) -> None:
-    raw_cid = str(args.source or "").strip().lower()
-    cid = SOURCE_ALIASES.get(raw_cid, raw_cid)
-    timeout = int(getattr(args, "timeout", 180) or 180)
-
-    plugins = load_plugin_connectors(root)
-    mod = plugins.get(cid)
-    if not mod:
-        if cid in KNOWN_WATER_CONNECTORS:
-            print(
-                f"❌ 连接器 `{cid}` 尚未安装。请先运行 `tree seed add {cid}` 从官方 `water` 仓库下载后再登录。",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"❌ 未找到连接器 `{cid}`。外部平台连接器请先运行 `tree seed add --list` 查看并安装。",
-                file=sys.stderr,
-            )
-        sys.exit(1)
-
-    login_fn = getattr(mod, "login_qr", None)
-    if not callable(login_fn):
-        print(f"ℹ️ 连接器 `{cid}` 无需交互登录，可直接运行 `tree seed extract --sources {cid}`。")
-        return
-
-    import inspect
-
-    kwargs: dict[str, Any] = {"timeout": timeout}
-    try:
-        sig_params = inspect.signature(login_fn).parameters
-        api_key = str(getattr(args, "api_key", "") or "")
-        client_id = str(getattr(args, "client_id", "") or "")
-        if "api_key" in sig_params:
-            kwargs["api_key"] = api_key
-        if "client_id" in sig_params:
-            kwargs["client_id"] = client_id
-    except Exception:
-        pass
-
-    ok = bool(login_fn(**kwargs))
-    log_audit(root, "seed:login", cid, detail=f"ok={ok}")
-    if not ok:
-        sys.exit(1)
-    print(f"👉 登录完成，可运行：`tree seed extract --sources {cid}` 提取脱敏线索。")
-
-
-def cmd_seed_add(root: Path, args: Any, log_audit: Callable[..., None]) -> None:
-    src_override = getattr(args, "from_source", "") or ""
-    try:
-        reg_raw = _read_water_resource("registry.json", source_override=src_override)
-        registry = json.loads(reg_raw.decode("utf-8"))
-    except Exception as e:
-        print(f"❌ 读取官方 `water` 连接器清单失败: {e}", file=sys.stderr)
-        print("   可检查网络后重试，或通过 `--from <本地water目录>` 指定本地仓库路径。", file=sys.stderr)
-        sys.exit(1)
-
-    conn_list = registry.get("connectors") or []
-    conn_map = {str(c.get("id", "")).lower(): c for c in conn_list if isinstance(c, dict) and c.get("id")}
-
-    if getattr(args, "list_only", False) or not getattr(args, "sources", ""):
-        installed = set(load_plugin_connectors(root).keys())
-        print("📦 Tree Seed 官方按需连接器库（GitHub: `shangxiuyu/water`）\n")
-        print("   说明：Tree 核心仅内置本机 AI 客户端与 Chrome；外部外脑与生活社交连接器托管在 `water`，按需下载即可：\n")
-        for cid, item in conn_map.items():
-            mark = "✅ 已安装" if cid in installed else "⬇ 可安装"
-            reqs = ", ".join(item.get("requires") or []) or "无（Python 标准库零依赖，下载即用）"
-            print(f"  [{cid:<10}] {mark}  {item.get('name', cid)}")
-            print(f"               提取范围: {', '.join(item.get('reads') or [])}")
-            print(f"               前置依赖: {reqs}\n")
-        zero_dep_avail = [k for k in ("getnote", "flomo", "weread", "jike") if k in conn_map]
-        sample_arg = ",".join(zero_dep_avail) if zero_dep_avail else ",".join(list(conn_map.keys())[:3])
-        if sample_arg:
-            print(f"👉 安装示例：`tree seed add {sample_arg}`")
-        return
-
-    requested = [SOURCE_ALIASES.get(s.strip().lower(), s.strip().lower()) for s in str(args.sources).split(",") if s.strip()]
-    builtin_hits = [s for s in requested if s in {"chrome", "claude", "codex", "antigravity", "cursor", "trae", "workbuddy", "douchat", "hermes", "openclaw", "eden", "deepseek"}]
-    if builtin_hits:
-        print(f"ℹ️ `{', '.join(builtin_hits)}` 已内置在 Tree 核心中，无需额外下载（直接用 `tree seed scan` 即可）。")
-        requested = [s for s in requested if s not in builtin_hits]
-        if not requested:
-            return
-
-    unknown = [s for s in requested if s not in conn_map]
-    if unknown:
-        print(f"❌ 官方 `water` 库中未找到连接器: {', '.join(unknown)}（可选: {', '.join(sorted(conn_map.keys()))}）", file=sys.stderr)
-        sys.exit(1)
-
-    dest_base = user_connectors_dir(root).resolve()
-    dest_base.mkdir(parents=True, exist_ok=True)
-
-    for cid in requested:
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", cid):
-            print(f"❌ 非法连接器标识: `{cid}`", file=sys.stderr)
-            sys.exit(1)
-        meta = conn_map[cid]
-        files = meta.get("files") or ([meta["file"]] if meta.get("file") else [])
-        if not files:
-            print(f"⚠️ 连接器 `{cid}` 未声明可下载文件，已跳过。", file=sys.stderr)
-            continue
-
-        pkg_dir = (dest_base / cid).resolve()
-        if not pkg_dir.is_relative_to(dest_base):
-            print(f"❌ 非法安装路径: `{cid}`", file=sys.stderr)
-            sys.exit(1)
-
-        if pkg_dir.exists() and not getattr(args, "force", False):
-            print(f"ℹ️ 连接器 `{cid}` 已存在于 `{pkg_dir.relative_to(root.resolve())}`（传 `--force` 可覆盖更新）。")
-        else:
-            expected_hashes = meta.get("sha256") if isinstance(meta.get("sha256"), dict) else {}
-            stage_dir = (dest_base / f".{cid}.{os.getpid()}.tmp").resolve()
-            backup_dir = (dest_base / f".{cid}.{os.getpid()}.bak").resolve()
-            for tmp_p in (stage_dir, backup_dir):
-                if tmp_p.is_symlink() or tmp_p.is_file():
-                    tmp_p.unlink()
-                elif tmp_p.exists():
-                    shutil.rmtree(tmp_p, ignore_errors=True)
-            stage_dir.mkdir(parents=True, exist_ok=True)
-            moved_backup = False
-            try:
-                for rel_f in files:
-                    raw_bytes = _read_water_resource(str(rel_f), source_override=src_override)
-                    exp_sha = str(expected_hashes.get(str(rel_f)) or "").strip().lower()
-                    if exp_sha:
-                        actual_sha = hashlib.sha256(raw_bytes).hexdigest().lower()
-                        if actual_sha != exp_sha:
-                            raise ValueError(
-                                f"校验失败：`{rel_f}` SHA256 不匹配 (期望 {exp_sha[:12]}，实际 {actual_sha[:12]})"
-                            )
-                    rel_sub = _safe_rel_subpath(str(rel_f), strip_prefix=f"connectors/{cid}")
-                    out_file = (stage_dir / rel_sub).resolve()
-                    if not out_file.is_relative_to(stage_dir):
-                        raise ValueError(f"越界文件写入被拦截: {rel_f}")
-                    out_file.parent.mkdir(parents=True, exist_ok=True)
-                    out_file.write_bytes(raw_bytes)
-                if pkg_dir.exists() or pkg_dir.is_symlink():
-                    pkg_dir.replace(backup_dir)
-                    moved_backup = True
-                stage_dir.replace(pkg_dir)
-                if moved_backup:
-                    if backup_dir.is_symlink() or backup_dir.is_file():
-                        backup_dir.unlink()
-                    elif backup_dir.exists():
-                        shutil.rmtree(backup_dir, ignore_errors=True)
-            except Exception as e:
-                if moved_backup and not pkg_dir.exists() and not pkg_dir.is_symlink() and (backup_dir.exists() or backup_dir.is_symlink()):
-                    try:
-                        backup_dir.replace(pkg_dir)
-                    except Exception:
-                        pass
-                shutil.rmtree(stage_dir, ignore_errors=True)
-                print(f"❌ 安装连接器 `{cid}` 失败（已自动回滚清理）: {e}", file=sys.stderr)
-                sys.exit(1)
-            log_audit(root, "seed:add", cid, detail=f"files={len(files)},src={src_override or 'official'}")
-            print(f"✅ 已安装连接器 `{cid}` ({meta.get('name', cid)}) -> `{pkg_dir.relative_to(root.resolve())}/`")
-
-        install_cmd = str(meta.get("install_cmd") or "").strip()
-        reqs = meta.get("requires") or []
-        if install_cmd:
-            print(f"   📦 请确认已安装依赖：`{install_cmd}`")
-        elif reqs:
-            print(f"   📦 前置依赖：{'; '.join(reqs)}")
-        print(f"   🚀 下一步：`tree seed login {cid}` -> `tree seed extract --sources {cid}`\n")
-
-
-def cmd_seed_remove(root: Path, args: Any, log_audit: Callable[..., None]) -> None:
-    raw = str(getattr(args, "sources", "") or "").strip()
-    if not raw:
-        print("❌ 请指定要卸载的连接器 ID，例如 `tree seed remove meituan`", file=sys.stderr)
-        sys.exit(1)
-    dest_base = user_connectors_dir(root).resolve()
-    targets = [SOURCE_ALIASES.get(s.strip().lower(), s.strip().lower()) for s in raw.split(",") if s.strip()]
-    for cid in targets:
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", cid):
-            print(f"❌ 非法连接器标识: `{cid}`", file=sys.stderr)
-            sys.exit(1)
-        pkg_dir = (dest_base / cid).resolve()
-        pkg_file = (dest_base / f"{cid}.py").resolve()
-        removed_any = False
-        if pkg_dir.is_dir() and pkg_dir.is_relative_to(dest_base):
-            shutil.rmtree(pkg_dir)
-            removed_any = True
-        if pkg_file.is_file() and pkg_file.is_relative_to(dest_base):
-            pkg_file.unlink()
-            removed_any = True
-        if removed_any:
-            log_audit(root, "seed:remove", cid)
-            print(f"🗑️ 已卸载连接器 `{cid}`")
-        else:
-            print(f"ℹ️ 连接器 `{cid}` 未安装（跳过）")
+    log_audit(root, "seed:clear", ".tree/staging", detail=f"removed={removed}")
+    print(f"🧹 已清空 `.tree/staging/`（移除 {removed} 个临时暂存文件，保留 `01~04` 知识库与 `.tree/sources.json` 增量游标）。")
 
 
 # ---------------------------------------------------------------------------
@@ -2793,7 +2545,7 @@ def _clean_handoff_text(text: str, keep_code: bool = False, max_len: int = 2400)
                 return blk
             return blk[:400].rstrip() + "\n... [长代码块已折叠，传 --raw-code 可查看全文]\n```"
         s = CODE_FENCE_RE.sub(_trim_fence, s)
-    s = redact_secrets(s).strip()
+    s = redact_all(s).strip()
     if not s:
         return ""
     low = s[:120].lower()
@@ -2816,7 +2568,7 @@ def _clean_handoff_text(text: str, keep_code: bool = False, max_len: int = 2400)
 
 
 def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20) -> list[dict[str, Any]]:
-    discovered, _ = scan_all_local_sources(None)
+    discovered = scan_all_local_sources(None)
     wanted = {s.strip().lower() for s in source_filter.split(",") if s.strip()} if source_filter else set(discovered.keys())
     q = query.strip().lower()
     items: list[dict[str, Any]] = []
@@ -2858,7 +2610,7 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                 preview = umsgs[0][:60] if umsgs else ""
             if not preview:
                 continue
-            display = f"{title} | {preview}" if title and title != preview else (preview or title)
+            display = redact_all(f"{title} | {preview}" if title and title != preview else (preview or title))
             if q and (q not in display.lower() and q not in raw_id.lower()):
                 continue
             items.append(
@@ -2891,7 +2643,7 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                                 ws_label = urllib.parse.unquote(fld.split("/")[-1])
                         except Exception:
                             pass
-                    conn = sqlite3.connect(f"file:{st}?mode=ro", uri=True)
+                    conn = _connect_sqlite_ro(st)
                     rows = conn.execute(
                         "SELECT value FROM ItemTable WHERE key LIKE 'memento/icube-ai-%chat-storage-%'"
                     ).fetchall()
@@ -2901,6 +2653,8 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                             obj = json.loads(v)
                         except Exception:
                             continue
+                        if not isinstance(obj, dict):
+                            continue
                         for s in obj.get("list", []):
                             if not isinstance(s, dict):
                                 continue
@@ -2909,27 +2663,23 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                                 continue
                             sid = str(s.get("sessionId") or s.get("id") or "")
                             title = str(s.get("title") or s.get("name") or "").replace("\n", " ").strip()
-                            created = int(s.get("updatedAt") or s.get("createdAt") or 0)
-                            mtime = created / 1000.0 if created > 1_000_000_000_000 else float(created)
-                            date_str = (
-                                datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-                                if mtime > 1_000_000_000
-                                else "unknown"
-                            )
+                            mtime = _ts_to_seconds(s.get("updatedAt") or s.get("createdAt") or 0)
+                            date_str = _safe_fromtimestamp(mtime, "%Y-%m-%d %H:%M", fallback="unknown")
                             first_user_msg = ""
                             for m in msgs:
                                 if isinstance(m, dict) and str(m.get("role", "")).lower() == "user":
-                                    first_user_msg = str(m.get("content") or m.get("text") or "").strip()
+                                    first_user_msg = extract_text_from_content(m.get("content") or m.get("text")).strip()
                                     if first_user_msg:
                                         break
                             display_title = title or (first_user_msg[:50] if first_user_msg else f"Session {sid[:8]}")
                             if ws_label and ws_label not in display_title:
                                 display_title = f"{display_title} ({ws_label})"
+                            display_title = redact_all(display_title)
                             if q and (q not in display_title.lower() and q not in sid.lower()):
                                 continue
                             items.append(
                                 {
-                                    "ref": f"trae:{sid[:12]}",
+                                    "ref": _format_chat_ref("trae", sid),
                                     "source": "trae",
                                     "raw_id": sid,
                                     "path": str(st),
@@ -2945,7 +2695,7 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
     if "cursor" in wanted and discovered.get("cursor", {}).get("db_path"):
         db_p = discovered["cursor"]["db_path"]
         try:
-            conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db_p)
             rows = conn.execute(
                 "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' ORDER BY rowid DESC LIMIT 400"
             ).fetchall()
@@ -2963,17 +2713,16 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                 if not (has_conv or has_headers):
                     continue
                 cid = str(obj.get("composerId") or key.split(":", 1)[-1])
-                created = int(obj.get("lastUpdatedAt") or obj.get("createdAt") or 0)
-                mtime = created / 1000.0 if created > 1_000_000_000_000 else float(created)
-                date_str = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime > 1_000_000_000 else "unknown"
-                title = str(obj.get("name") or obj.get("text") or "").replace("\n", " ").strip()[:90]
+                mtime = _ts_to_seconds(obj.get("lastUpdatedAt") or obj.get("createdAt") or 0)
+                date_str = _safe_fromtimestamp(mtime, "%Y-%m-%d %H:%M", fallback="unknown")
+                title = redact_all(str(obj.get("name") or obj.get("text") or "").replace("\n", " ").strip())[:90]
                 if not title:
                     title = f"Composer {cid[:8]}"
                 if q and (q not in title.lower() and q not in cid.lower()):
                     continue
                 items.append(
                     {
-                        "ref": f"cursor:{cid[:12]}",
+                        "ref": _format_chat_ref("cursor", cid),
                         "source": "cursor",
                         "raw_id": cid,
                         "path": db_p,
@@ -2985,24 +2734,28 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
         except Exception:
             pass
 
-    # 3. Douchat SQLite
+    # 4. Douchat SQLite
     if "douchat" in wanted and discovered.get("douchat", {}).get("db_path"):
         db_p = discovered["douchat"]["db_path"]
         try:
-            conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db_p)
             rows = conn.execute("SELECT id, updatedAt, data FROM conversations ORDER BY updatedAt DESC LIMIT 30").fetchall()
             conn.close()
             for cid, updated_at, cdata in rows:
-                cobj = json.loads(cdata or "{}")
-                cname = str(cobj.get("name") or cid)[:80]
-                ts = int(updated_at or 0)
-                mtime = ts / 1000.0 if ts > 1_000_000_000_000 else float(ts)
-                date_str = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime > 1_000_000_000 else "unknown"
+                try:
+                    cobj = json.loads(cdata or "{}")
+                except Exception:
+                    cobj = {}
+                if not isinstance(cobj, dict):
+                    cobj = {}
+                cname = redact_all(str(cobj.get("name") or cid))[:80]
+                mtime = _ts_to_seconds(updated_at or 0)
+                date_str = _safe_fromtimestamp(mtime, "%Y-%m-%d %H:%M", fallback="unknown")
                 if q and (q not in cname.lower() and q not in cid.lower()):
                     continue
                 items.append(
                     {
-                        "ref": f"douchat:{cid[:16]}",
+                        "ref": _format_chat_ref("douchat", str(cid)),
                         "source": "douchat",
                         "raw_id": cid,
                         "path": db_p,
@@ -3014,18 +2767,18 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
         except Exception:
             pass
 
-    # 4. Eden SQLite
+    # 5. Eden SQLite
     if "eden" in wanted and discovered.get("eden", {}).get("db_path"):
         db_p = discovered["eden"]["db_path"]
         try:
-            conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db_p)
             room_names = {r[0]: str(r[1] or r[0]) for r in conn.execute("SELECT id, name FROM rooms").fetchall()}
             rows = conn.execute(
                 "SELECT room_id, MAX(timestamp) AS last_ts, COUNT(*) FROM messages WHERE sender_id = 'WebUser' AND type = 'chat' GROUP BY room_id ORDER BY last_ts DESC LIMIT 30"
             ).fetchall()
             conn.close()
             for rid, last_ts, cnt in rows:
-                rname = room_names.get(rid, rid)
+                rname = redact_all(room_names.get(rid, rid))
                 ts_str = str(last_ts or "")[:16].replace("T", " ")
                 try:
                     mtime = datetime.datetime.fromisoformat(str(last_ts).replace("Z", "+00:00")).timestamp()
@@ -3036,7 +2789,7 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                     continue
                 items.append(
                     {
-                        "ref": f"eden:{rid[:16]}",
+                        "ref": _format_chat_ref("eden", str(rid)),
                         "source": "eden",
                         "raw_id": rid,
                         "path": db_p,
@@ -3048,13 +2801,18 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
         except Exception:
             pass
 
-    # 5. Hermes SQLite
+    # 6. Hermes SQLite
     if "hermes" in wanted and discovered.get("hermes", {}).get("db_path"):
         db_p = discovered["hermes"]["db_path"]
         try:
-            conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+            conn = _connect_sqlite_ro(db_p)
+            norm_ts_expr = (
+                "CASE WHEN COALESCE(last_activity_at, started_at, 0) > 1000000000000 "
+                "THEN COALESCE(last_activity_at, started_at, 0) / 1000.0 "
+                "ELSE COALESCE(last_activity_at, started_at, 0) END"
+            )
             rows = conn.execute(
-                "SELECT id, COALESCE(title, id), COALESCE(last_activity_at, started_at, 0) AS ts, COALESCE(message_count, 0) "
+                f"SELECT id, COALESCE(title, id), ({norm_ts_expr}) AS ts, COALESCE(message_count, 0) "
                 "FROM sessions WHERE COALESCE(message_count, 0) > 0 ORDER BY ts DESC LIMIT 80"
             ).fetchall()
             conn.close()
@@ -3063,16 +2821,14 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
                 low_title = stitle_str.strip().lower()
                 if low_title.startswith(("[eden runtime context]", "这是 ahub 的私有 ai 主动检查")):
                     continue
-                sec = float(ts or 0)
-                if sec > 1_000_000_000_000:
-                    sec /= 1000.0
-                date_str = datetime.datetime.fromtimestamp(sec).strftime("%Y-%m-%d %H:%M") if sec > 1_000_000_000 else "unknown"
-                title = f"{stitle_str[:70]} ({mcnt} 条消息)"
+                sec = _ts_to_seconds(ts)
+                date_str = _safe_fromtimestamp(sec, "%Y-%m-%d %H:%M", fallback="unknown")
+                title = f"{redact_all(stitle_str)[:70]} ({mcnt} 条消息)"
                 if q and (q not in title.lower() and q not in str(sid).lower()):
                     continue
                 items.append(
                     {
-                        "ref": f"hermes:{str(sid)[:16]}",
+                        "ref": _format_chat_ref("hermes", str(sid)),
                         "source": "hermes",
                         "raw_id": str(sid),
                         "path": db_p,
@@ -3090,7 +2846,7 @@ def _list_recent_chats(source_filter: str = "", query: str = "", limit: int = 20
 
 def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) -> tuple[str, list[tuple[str, str]]]:
     """Return (session_header, [(role_label, cleaned_text), ...]) for a specific cross-agent session."""
-    discovered, _ = scan_all_local_sources(None)
+    discovered = scan_all_local_sources(None)
     src = source.lower().strip()
     turns: list[tuple[str, str]] = []
 
@@ -3105,6 +2861,8 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    continue
+                if not isinstance(obj, dict):
                     continue
                 t = obj.get("type")
                 if t in ("user", "assistant") and not obj.get("isSidechain"):
@@ -3129,6 +2887,8 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    continue
+                if not isinstance(obj, dict):
                     continue
                 payload = obj.get("payload")
                 if obj.get("type") == "response_item" and isinstance(payload, dict) and payload.get("type") == "message":
@@ -3156,6 +2916,8 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                     obj = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(obj, dict):
+                    continue
                 t = obj.get("type")
                 if t in ("USER_INPUT", "PLANNER_RESPONSE"):
                     raw = extract_text_from_content(obj.get("content"))
@@ -3176,14 +2938,18 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
             if not st.is_file():
                 continue
             try:
-                conn = sqlite3.connect(f"file:{st}?mode=ro", uri=True)
+                conn = _connect_sqlite_ro(st)
                 rows = conn.execute(
                     "SELECT value FROM ItemTable WHERE key LIKE 'memento/icube-ai-%chat-storage-%'"
                 ).fetchall()
                 conn.close()
                 for (v,) in rows:
                     obj = json.loads(v)
+                    if not isinstance(obj, dict):
+                        continue
                     for s in obj.get("list", []):
+                        if not isinstance(s, dict):
+                            continue
                         sid = str(s.get("sessionId") or s.get("id") or "")
                         if sid.startswith(id_prefix):
                             target_session = s
@@ -3206,26 +2972,27 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
         if not target_session:
             raise FileNotFoundError(f"未找到 Trae 会话: {id_prefix}")
 
-        title = str(target_session.get("title") or target_session.get("name") or id_prefix)
-        created = int(target_session.get("updatedAt") or target_session.get("createdAt") or 0)
-        date_str = (
-            datetime.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
-            if created > 1_000_000_000_000
-            else (datetime.datetime.fromtimestamp(created).strftime("%Y-%m-%d") if created > 1_000_000_000 else "recent")
-        )
+        title = redact_all(str(target_session.get("title") or target_session.get("name") or id_prefix))
+        created = target_session.get("updatedAt") or target_session.get("createdAt") or 0
+        date_str = _safe_fromtimestamp(created, "%Y-%m-%d", fallback="recent")
 
         for m in target_session.get("messages", []):
             if not isinstance(m, dict):
                 continue
             role = str(m.get("role", "")).lower()
+            if role not in ("user", "assistant"):
+                continue
             author_label = "User" if role == "user" else "Trae AI"
-            content = m.get("content") or m.get("text")
+            content_raw = m.get("content") or m.get("text")
+            content = extract_text_from_content(content_raw)
             # If assistant content is empty in builder mode, fallback to proposal
             if not content and role == "assistant":
                 task_content = m.get("agentTaskContent")
                 if isinstance(task_content, dict):
-                    content = task_content.get("proposal") or task_content.get("proposalReasoningContent")
-            cleaned = _clean_handoff_text(str(content or ""), keep_code=keep_code)
+                    content = extract_text_from_content(
+                        task_content.get("proposal") or task_content.get("proposalReasoningContent")
+                    )
+            cleaned = _clean_handoff_text(content, keep_code=keep_code)
             if cleaned:
                 turns.append((author_label, cleaned))
 
@@ -3243,6 +3010,8 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    continue
+                if not isinstance(obj, dict):
                     continue
                 if obj.get("type") == "message":
                     role = str(obj.get("role", "")).lower()
@@ -3264,9 +3033,13 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                 obj = json.loads(line)
             except Exception:
                 continue
+            if not isinstance(obj, dict):
+                continue
             t = obj.get("type")
             if t == "user/message":
                 data = obj.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
                 src_info = data.get("source")
                 if isinstance(src_info, dict) and str(src_info.get("kind") or "") in ("agent-instructions", "runtime-context"):
                     continue
@@ -3275,7 +3048,8 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                 if cleaned:
                     turns.append(("User", cleaned))
             elif t == "assistant/message":
-                msg = (obj.get("data") or {}).get("message")
+                data = obj.get("data") or {}
+                msg = data.get("message") if isinstance(data, dict) else None
                 if isinstance(msg, dict):
                     raw = extract_text_from_content(msg.get("content"))
                     cleaned = _clean_handoff_text(raw, keep_code=keep_code)
@@ -3288,7 +3062,7 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
         if not db_p:
             raise FileNotFoundError("本机未找到 Cursor state.vscdb")
         escaped_prefix = id_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_p)
         try:
             row = conn.execute(
                 "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? ESCAPE '\\' LIMIT 1",
@@ -3299,7 +3073,7 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
             key, val = row
             obj = json.loads(val or "{}")
             cid = str(obj.get("composerId") or key.split(":", 1)[-1])
-            title = str(obj.get("name") or cid[:12])
+            title = redact_all(str(obj.get("name") or cid[:12]))
             conv = obj.get("conversation")
             if isinstance(conv, list) and conv:
                 for item in conv:
@@ -3338,13 +3112,20 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
         if not db_p:
             raise FileNotFoundError("本机未找到豆包工作 douchat.db")
         escaped_prefix = id_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_p)
         try:
             row = conn.execute("SELECT id, data FROM conversations WHERE id LIKE ? ESCAPE '\\' LIMIT 1", (f"{escaped_prefix}%",)).fetchone()
             if not row:
                 raise FileNotFoundError(f"未找到豆包工作会话: {id_prefix}")
             cid, cdata = row
-            cname = str(json.loads(cdata or "{}").get("name") or cid)
+            try:
+                cobj = json.loads(cdata or "{}")
+            except Exception:
+                cobj = {}
+            if not isinstance(cobj, dict):
+                cobj = {}
+            cname = redact_all(str(cobj.get("name") or cid))
+            owner_id = str(cobj.get("ownerId") or "")
             mrows = conn.execute("SELECT data FROM messages WHERE conversationId = ? ORDER BY createdAt ASC LIMIT 200", (cid,)).fetchall()
         finally:
             conn.close()
@@ -3353,8 +3134,16 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
                 mobj = json.loads(mdata or "{}")
             except Exception:
                 continue
-            author = str(mobj.get("authorName") or mobj.get("authorId") or "AI")
-            role = "User" if str(mobj.get("authorId", "")).lower() == "user" or author.lower() == "you" else author
+            if not isinstance(mobj, dict):
+                continue
+            aid = str(mobj.get("authorId") or "")
+            author = str(mobj.get("authorName") or aid or "AI")
+            is_human = (
+                aid.lower() in {"user", "human"}
+                or author.lower() in {"you", "user"}
+                or (owner_id and aid == owner_id)
+            )
+            role = "User" if is_human else author
             cleaned = _clean_handoff_text(str(mobj.get("text") or ""), keep_code=keep_code)
             if cleaned:
                 turns.append((role, cleaned))
@@ -3365,7 +3154,7 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
         if not db_p:
             raise FileNotFoundError("本机未找到 Eden ahub.db")
         escaped_prefix = id_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_p)
         try:
             row = conn.execute("SELECT id, name FROM rooms WHERE id LIKE ? ESCAPE '\\' LIMIT 1", (f"{escaped_prefix}%",)).fetchone()
             if not row:
@@ -3382,14 +3171,14 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
             cleaned = _clean_handoff_text(str(content or ""), keep_code=keep_code)
             if cleaned:
                 turns.append((role, cleaned))
-        return f"Eden 房间 `{rname}` ({rid[:16]})", turns
+        return f"Eden 房间 `{redact_all(str(rname))}` ({rid[:16]})", turns
 
     if src == "hermes":
         db_p = discovered.get("hermes", {}).get("db_path")
         if not db_p:
             raise FileNotFoundError("本机未找到 Hermes state.db")
         escaped_prefix = id_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conn = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+        conn = _connect_sqlite_ro(db_p)
         try:
             row = conn.execute("SELECT id, COALESCE(title, id) FROM sessions WHERE id LIKE ? ESCAPE '\\' LIMIT 1", (f"{escaped_prefix}%",)).fetchone()
             if not row:
@@ -3406,7 +3195,7 @@ def _read_session_turns(source: str, id_prefix: str, keep_code: bool = False) ->
             cleaned = _clean_handoff_text(str(content or ""), keep_code=keep_code)
             if cleaned:
                 turns.append((rlabel, cleaned))
-        return f"Hermes `{stitle}` ({str(sid)[:16]})", turns
+        return f"Hermes `{redact_all(str(stitle))}` ({str(sid)[:16]})", turns
 
     raise ValueError(f"不支持的会话来源: {source}（支持: claude, codex, antigravity, cursor, trae, workbuddy, douchat, hermes, eden, deepseek）")
 
@@ -3429,6 +3218,10 @@ def cmd_chat_read(root: Path, args: Any, log_audit: Callable[..., None]) -> None
         print("❌ 会话标识格式须为 `<source>:<id前缀>`，例如 `cursor:000f4926` 或 `claude:1a2b3c4d`。请先运行 `tree chat list` 查看。", file=sys.stderr)
         sys.exit(1)
     source, id_prefix = ref.split(":", 1)
+    id_prefix = id_prefix.strip()
+    if not id_prefix:
+        print("❌ 会话 ID 前缀不能为空，格式须为 `<source>:<id前缀>`（请先运行 `tree chat list` 查看）。", file=sys.stderr)
+        sys.exit(1)
     try:
         header, turns = _read_session_turns(source, id_prefix, keep_code=bool(args.raw_code))
     except Exception as e:
