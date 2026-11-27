@@ -28,32 +28,32 @@
 
 ## 30 秒快速上手
 
-环境要求：**Python ≥ 3.9** 与 **Git**（100% Python 标准库实现，零第三方依赖，macOS / Linux 开箱即用）。
+环境要求：**Python ≥ 3.9** 与 **Git**（100% Python 标准库实现，零第三方依赖，macOS / Linux 开箱即用）。以下两种方式任选其一，点击代码块右上角即可一键复制：
+
+### 方式一：终端一行命令安装
+
+打开终端粘贴回车，一步完成克隆、初始化与客户端挂载（装完向任意 AI 发送 `帮我扫描本机记忆并初始化 Tree` 即可破土）：
 
 ```bash
-# 1. 克隆工具仓库
-git clone https://github.com/shangxiuyu/Tree.git && cd Tree
-
-# 2. 初始化个人知识库（默认创建于 ./vault，也可通过 TREE_HOME 指定任意目录）
-./bin/tree init
-
-# 3. 按最小足迹原则挂载 CLI、Skill 与全局受控块到本机已安装的 AI 客户端
-./bin/tree install-skill
+git clone https://github.com/shangxiuyu/Tree.git ~/Tree && ~/Tree/bin/tree init && ~/Tree/bin/tree install-skill
 ```
 
-装好后无需手填配置：
+### 方式二：复制提示词，交给 AI 全自动搞定
 
-1. **冷启动破土**：打开任意已挂载的 AI 客户端，直接发送 **「帮我扫描本机记忆并初始化 Tree」** —— AI 会调用内置的 `tree seed` 只读扫描本机历史对话与记忆（自动剥离代码块与敏感密钥），整理草案经你确认后入树。
-2. **日常查看与维护**：直接用 **Obsidian / VS Code** 等任意编辑器浏览或手改 `vault/` 下的 Markdown，所有变更由 Git 完整留痕：
-   ```bash
-   tree lint   # 巡检断链、孤儿页、格式与敏感凭证
-   tree log    # 查看认知演进历史与 Agent 读写审计
-   ```
+不想自己敲命令？复制下面这段话，直接发给 Claude Code、Cursor、Codex、Antigravity、Trae、Windsurf 或任意支持本地命令的 AI 助手：
+
+```text
+请帮我安装并配置 Tree 个人上下文系统（https://github.com/shangxiuyu/Tree.git）：
+1. 将仓库克隆到 ~/Tree，依次执行 ~/Tree/bin/tree init 和 ~/Tree/bin/tree install-skill 完成挂载；
+2. 执行 ~/Tree/bin/tree seed scan 只读扫描我本机已有的 AI 记忆与对话源，把扫描结果和初始化方案发我确认后再提炼入树。
+```
+
+日常可直接用 **Obsidian / VS Code** 打开 `~/Tree/vault` 浏览或手改 Markdown，所有变更由 Git 完整留痕（终端随时可跑 `tree lint` 体检、`tree log` 查历史）。
 
 <details>
 <summary><b>自定义知识库位置与 PATH 说明</b></summary>
 
-- **自定义存储路径**：初始化或挂载时可通过 `TREE_HOME=/your/path ./bin/tree init` 指定任意目录（例如放进你的 Obsidian 库或同步盘）。
+- **自定义存储路径**：若希望将个人知识库放在指定位置（如现有 Obsidian 库或同步盘），把安装命令中的后两步加上 `TREE_HOME=/your/path` 即可（例如 `TREE_HOME=~/Obsidian/Tree ~/Tree/bin/tree init`）。
 - **路径解析优先级**：`TREE_HOME` 环境变量 → 当前工作目录向上查找 `.tree/config.json` → `~/.config/tree/home`（`init` / `install-skill` 时自动记录，此后裸跑 `tree` 自动命中）→ 仓库默认 `vault/`。
 - **与系统 `tree` 命令共存**：若本机通过 Homebrew 安装过目录树工具 `/opt/homebrew/bin/tree`，请确保 `~/.local/bin` 在 `PATH` 中排在前面。
 
